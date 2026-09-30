@@ -1,0 +1,885 @@
+diff --git a/sandbox/policy/sandbox_type.cc b/sandbox/policy/sandbox_type.cc
+index 1b87649d48f1c..c3cb672ca7ce3 100644
+--- a/sandbox/policy/sandbox_type.cc
++++ b/sandbox/policy/sandbox_type.cc
+@@ -18,6 +18,10 @@
+ #include "media/media_buildflags.h"  // nogncheck
+ #endif
+ 
++#if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
++#endif
++
+ namespace sandbox::policy {
+ 
+ namespace {
+@@ -192,15 +196,24 @@ sandbox::mojom::Sandbox SandboxTypeFromCommandLine(
+   if (process_type.empty())
+     return Sandbox::kNoSandbox;
+ 
+-  if (process_type == switches::kRendererProcess)
++  if (process_type == switches::kRendererProcess) {
++    if (command_line.HasSwitch("legacy-sandbox"))
++      return Sandbox::kNoSandbox;
+     return Sandbox::kRenderer;
++  }
+ 
+   if (process_type == switches::kUtilityProcess) {
++#if BUILDFLAG(IS_WIN)
++    if (base::win::GetVersion() < base::win::Version::WIN10) {
++        return Sandbox::kNoSandbox;
++    }
++#endif
+     return UtilitySandboxTypeFromString(
+         command_line.GetSwitchValueASCII(switches::kServiceSandboxType));
+   }
+   if (process_type == switches::kGpuProcess) {
+-    if (command_line.HasSwitch(switches::kDisableGpuSandbox))
++    if (command_line.HasSwitch(switches::kDisableGpuSandbox) ||
++        command_line.HasSwitch("legacy-sandbox"))
+       return Sandbox::kNoSandbox;
+     return Sandbox::kGpu;
+   }
+diff --git a/sandbox/policy/win/sandbox_win.cc b/sandbox/policy/win/sandbox_win.cc
+index 1d798fecab6c7..9ec89be806e75 100644
+--- a/sandbox/policy/win/sandbox_win.cc
++++ b/sandbox/policy/win/sandbox_win.cc
+@@ -223,7 +223,9 @@ ResultCode AddDefaultConfigForSandboxedProcess(TargetConfig* config) {
+     return result;
+ 
+   config->SetLockdownDefaultDacl();
+-  config->AddKernelObjectToClose(HandleToClose::kDeviceApi);
++  // Win8+ adds a device DeviceApi that we don't need.
++  if (base::win::GetVersion() >= base::win::Version::WIN8)
++    config->AddKernelObjectToClose(HandleToClose::kDeviceApi);
+   config->SetDesktop(Desktop::kAlternateWinstation);
+ 
+   return SBOX_ALL_OK;
+@@ -627,12 +629,18 @@ ResultCode LaunchWithoutSandbox(
+   // on process shutdown, in which case TerminateProcess can fail. See
+   // https://crbug.com/820996.
+   if (delegate->ShouldUnsandboxedRunInJob()) {
++    BOOL in_job = true;
++    // Prior to Windows 8 nested jobs aren't possible.
++    if (base::win::GetVersion() >= base::win::Version::WIN8 ||
++        (::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) &&
++         !in_job)) {
+     static base::NoDestructor<base::win::ScopedHandle> job_object(
+         CreateUnsandboxedJob());
+     if (!job_object->is_valid()) {
+       return SBOX_ERROR_CANNOT_INIT_JOB;
+     }
+     options.job_handle = job_object->get();
++    }
+   }
+ 
+   // Chromium binaries are marked as CET Compatible but some processes
+@@ -725,6 +733,9 @@ void SandboxWin::AddBaseHandleClosePolicy(TargetConfig* config) {
+ ResultCode SandboxWin::AddAppContainerPolicy(TargetConfig* config,
+                                              base::wcstring_view sid) {
+   DCHECK(!config->IsConfigured());
++  // Win32k Lockdown is supported on Windows 8+.
++  if (base::win::GetVersion() < base::win::Version::WIN8)
++    return SBOX_ALL_OK;
+   if (IsAppContainerEnabled()) {
+     ResultCode result = config->SetLowBox(sid);
+     if (result != SBOX_ALL_OK) {
+diff --git a/sandbox/win/src/broker_services.cc b/sandbox/win/src/broker_services.cc
+index 0b3de828ecec1..861fda525b26a 100644
+--- a/sandbox/win/src/broker_services.cc
++++ b/sandbox/win/src/broker_services.cc
+@@ -553,7 +553,11 @@ BrokerServicesBase::PreSpawnTarget(PolicyBase* policy_base) {
+     startup_info->SetAppContainer(container);
+   }
+ 
+-  startup_info->AddJobToAssociate(policy_base->GetJobHandle());
++  // On Win10, jobs are associated via startup_info.
++  if (base::win::GetVersion() >= base::win::Version::WIN10 &&
++      policy_base->HasJob()) {
++    startup_info->AddJobToAssociate(policy_base->GetJobHandle());
++  }
+ 
+   if (!startup_info->BuildStartupInformation()) {
+     return base::unexpected(SBOX_ERROR_PROC_THREAD_ATTRIBUTES);
+diff --git a/sandbox/win/src/handle_closer_agent.cc b/sandbox/win/src/handle_closer_agent.cc
+index 047fe689715a1..996329a077206 100644
+--- a/sandbox/win/src/handle_closer_agent.cc
++++ b/sandbox/win/src/handle_closer_agent.cc
+@@ -18,6 +18,7 @@
+ #include "base/win/static_constants.h"
+ #include "base/win/win_util.h"
+ #include "base/win/windows_handle_util.h"
++#include "base/win/windows_version.h"
+ #include "sandbox/win/src/heap_helper.h"
+ #include "sandbox/win/src/win_utils.h"
+ 
+@@ -166,6 +167,13 @@ bool HandleCloserAgent::CloseHandles() {
+     return false;
+   }
+ 
++  if (base::win::GetVersion() < base::win::Version::WIN8_1)  {
++	if(GetCurrentProcessHandlesWin7())
++		return true;
++	else
++		return false;
++  }
++
+   // The system call will return only handles up to the buffer size so add a
+   // margin of error of an additional 1000 handles.
+   auto handles = base::HeapArray<uint32_t>::WithSize(handle_count + 1000);
+diff --git a/sandbox/win/src/interception.cc b/sandbox/win/src/interception.cc
+index d074722947cb1..23d2526d8e5d4 100644
+--- a/sandbox/win/src/interception.cc
++++ b/sandbox/win/src/interception.cc
+@@ -21,6 +21,7 @@
+ #include "base/rand_util.h"
+ #include "base/scoped_native_library.h"
+ #include "base/win/pe_image.h"
++#include "base/win/windows_version.h"
+ #include "sandbox/win/src/interception_internal.h"
+ #include "sandbox/win/src/interceptors.h"
+ #include "sandbox/win/src/internal_types.h"
+@@ -394,7 +395,39 @@ InterceptionManager::PatchClientFunctions(DllInterceptionData* thunks,
+   patch.dll_data.num_thunks = 0;
+   patch.dll_data.used_bytes = offsetof(DllInterceptionData, thunks);
+ 
+-  ServiceResolverThunk thunk(child_->Process(), /*relaxed=*/true);
++  std::unique_ptr<ServiceResolverThunk> thunk;
++#if defined(_WIN64)
++  thunk = std::make_unique<ServiceResolverThunk>(child_->Process(), true);
++#else
++  DWORD base_code = 0;
++  DWORD bytes_read = 0;
++  base::win::OSInfo* os_info = base::win::OSInfo::GetInstance();
++  base::win::Version real_os_version = os_info->Kernel32Version();
++  if (os_info->IsWowX86OnAMD64()) {
++    if (real_os_version >= base::win::Version::WIN10)
++      thunk.reset(new Wow64W10ResolverThunk(child_->Process(), true));
++    else if (real_os_version >= base::win::Version::WIN8)
++      thunk.reset(new Wow64W8ResolverThunk(child_->Process(), true));
++    else {
++      thunk.reset(new Wow64ResolverThunk(child_->Process(), true));
++	  if(!::ReadProcessMemory(child_->Process(), ntdll_base, &base_code,
++			sizeof(base_code), &bytes_read)) {
++				if(::GetLastError() == ERROR_PARTIAL_COPY) {
++					//::ResumeThread(child_->MainThread());
++					while(!::ReadProcessMemory(child_->Process(), ntdll_base, &base_code,
++						sizeof(base_code), &bytes_read)) {
++						;
++					}
++					//::SuspendThread(child_->MainThread());
++					}
++			}
++	}
++  } else if (real_os_version >= base::win::Version::WIN8) {
++    thunk.reset(new Win8ResolverThunk(child_->Process(), true));
++  } else {
++    thunk.reset(new ServiceResolverThunk(child_->Process(), true));
++  }
++#endif
+ 
+   patch.originals = {};
+   for (const auto& interception : interceptions_) {
+@@ -406,7 +439,7 @@ InterceptionManager::PatchClientFunctions(DllInterceptionData* thunks,
+       return base::unexpected(SBOX_ERROR_BAD_PARAMS);
+ 
+     NTSTATUS ret =
+-        thunk.Setup(ntdll_base, interception.function.c_str(),
++        thunk->Setup(ntdll_base, interception.function.c_str(),
+                     interception.interceptor_address,
+                     &UNSAFE_TODO(thunks->thunks[patch.dll_data.num_thunks]),
+                     thunk_bytes - patch.dll_data.used_bytes, nullptr);
+diff --git a/sandbox/win/src/process_mitigations.cc b/sandbox/win/src/process_mitigations.cc
+index 38ae75ee7b2b9..12a58a90cd68a 100644
+--- a/sandbox/win/src/process_mitigations.cc
++++ b/sandbox/win/src/process_mitigations.cc
+@@ -58,7 +58,8 @@ const ULONG64* GetSupportedMitigations() {
+         (base::win::GetVersion() >= base::win::Version::WIN10_RS2)
+             ? (sizeof(mitigations[0]) * 2)
+             : sizeof(mitigations[0]);
+-    if (!::GetProcessMitigationPolicy(::GetCurrentProcess(),
++    if (base::win::GetVersion() > base::win::Version::WIN7 &&
++        !::GetProcessMitigationPolicy(::GetCurrentProcess(),
+                                       ProcessMitigationOptionsMask,
+                                       &mitigations, mits_size)) {
+       NOTREACHED();
+@@ -111,7 +112,8 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+     const DWORD directory_flags =
+         LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS;
+ #endif
+-    if (!::SetDefaultDllDirectories(directory_flags)) {
++    if (base::win::GetVersion() >= base::win::Version::WIN7 &&
++        !::SetDefaultDllDirectories(directory_flags)) {
+       return false;
+     }
+ 
+@@ -158,6 +160,10 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+   }
+ #endif
+ 
++  // This is all we can do in Win7 and below.
++  if (version < base::win::Version::WIN8)
++    return true;
++
+   // Enable ASLR policies.
+   if (flags & MITIGATION_RELOCATE_IMAGE) {
+     PROCESS_MITIGATION_ASLR_POLICY policy = {};
+diff --git a/sandbox/win/src/restricted_token.cc b/sandbox/win/src/restricted_token.cc
+index 15c8dc1b7c9a0..d5eceef52b33d 100644
+--- a/sandbox/win/src/restricted_token.cc
++++ b/sandbox/win/src/restricted_token.cc
+@@ -16,6 +16,7 @@
+ #include "base/logging.h"
+ #include "base/win/access_token.h"
+ #include "base/win/security_util.h"
++#include "base/win/windows_version.h"
+ #include "sandbox/win/src/acl.h"
+ 
+ namespace sandbox {
+@@ -188,7 +189,7 @@ std::optional<base::win::AccessToken> RestrictedToken::CreateRestricted(
+     return std::nullopt;
+   }
+ 
+-  if (lockdown_default_dacl_) {
++  if (lockdown_default_dacl_ && base::win::GetVersion() >= base::win::Version::VISTA) {
+     // Don't add Restricted sid and also remove logon sid access.
+     std::optional<base::win::Sid> logon_sid = new_token->LogonId();
+     if (logon_sid.has_value()) {
+@@ -249,7 +250,7 @@ std::optional<base::win::AccessToken> RestrictedToken::CreateRestricted(
+     return std::nullopt;
+   }
+ 
+-  if (integrity_rid_.has_value()) {
++  if (integrity_rid_.has_value() && base::win::GetVersion() >= base::win::Version::VISTA) {
+     if (!new_token->SetIntegrityLevel(*integrity_rid_)) {
+       return std::nullopt;
+     }
+diff --git a/sandbox/win/src/service_resolver.h b/sandbox/win/src/service_resolver.h
+index cdfc19035bcb1..85ef35a37d9d7 100644
+--- a/sandbox/win/src/service_resolver.h
++++ b/sandbox/win/src/service_resolver.h
+@@ -46,23 +46,23 @@ class [[clang::lto_visibility_public]] ServiceResolverThunk
+   size_t GetThunkSize() const override;
+ 
+   // Call this to set up ntdll_base_ which will allow for local patches.
+-  void AllowLocalPatches();
++  virtual void AllowLocalPatches();
+ 
+   // Verifies that the function specified by |target_name| in |target_module| is
+   // a service and copies the data from that function into |thunk_storage|. If
+   // |storage_bytes| is too small, then the method fails.
+-  NTSTATUS CopyThunk(const void* target_module,
+-                     const char* target_name,
+-                     BYTE* thunk_storage,
+-                     size_t storage_bytes,
+-                     size_t* storage_used);
++  virtual NTSTATUS CopyThunk(const void* target_module,
++                             const char* target_name,
++                             BYTE* thunk_storage,
++                             size_t storage_bytes,
++                             size_t* storage_used);
+ 
+   // Checks if a target was patched correctly for a jump. This is only for use
+   // in testing in 32-bit builds. Will always return true on 64-bit builds. Set
+   // |thunk_storage| to the same pointer passed to Setup().
+   bool VerifyJumpTargetForTesting(void* thunk_storage) const;
+ 
+- private:
++ protected:
+   // The unit test will use this member to allow local patch on a buffer.
+   HMODULE ntdll_base_;
+ 
+@@ -80,7 +80,7 @@ class [[clang::lto_visibility_public]] ServiceResolverThunk
+   // Returns true if the code pointer by target_ corresponds to the expected
+   // type of function. Saves that code on the first part of the thunk pointed
+   // by local_thunk (should be directly accessible from the parent).
+-  bool IsFunctionAService(void* local_thunk) const;
++  virtual bool IsFunctionAService(void* local_thunk) const;
+ 
+   // Performs the actual patch of target_.
+   // local_thunk must be already fully initialized, and the first part must
+@@ -88,7 +88,7 @@ class [[clang::lto_visibility_public]] ServiceResolverThunk
+   // (yes, private). remote_thunk (real type ServiceFullThunk), must be
+   // allocated on the child, and will contain the thunk data, after this call.
+   // Returns the appropriate status code.
+-  NTSTATUS PerformPatch(void* local_thunk, void* remote_thunk);
++  virtual NTSTATUS PerformPatch(void* local_thunk, void* remote_thunk);
+ 
+   // Provides basically the same functionality as IsFunctionAService but it
+   // continues even if it does not recognize the function code. remote_thunk
+@@ -100,6 +100,74 @@ class [[clang::lto_visibility_public]] ServiceResolverThunk
+   ULONG relative_jump_;
+ };
+ 
++// This is the concrete resolver used to perform service-call type functions
++// inside ntdll.dll on WOW64 (32 bit ntdll on 64 bit Vista).
++class Wow64ResolverThunk : public ServiceResolverThunk {
++ public:
++  // The service resolver needs a child process to write to.
++  Wow64ResolverThunk(HANDLE process, bool relaxed)
++      : ServiceResolverThunk(process, relaxed) {}
++
++  Wow64ResolverThunk(const Wow64ResolverThunk&) = delete;
++  Wow64ResolverThunk& operator=(const Wow64ResolverThunk&) = delete;
++
++  ~Wow64ResolverThunk() override {}
++
++ private:
++  bool IsFunctionAService(void* local_thunk) const override;
++};
++
++// This is the concrete resolver used to perform service-call type functions
++// inside ntdll.dll on WOW64 for Windows 8.
++class Wow64W8ResolverThunk : public ServiceResolverThunk {
++ public:
++  // The service resolver needs a child process to write to.
++  Wow64W8ResolverThunk(HANDLE process, bool relaxed)
++      : ServiceResolverThunk(process, relaxed) {}
++
++  Wow64W8ResolverThunk(const Wow64W8ResolverThunk&) = delete;
++  Wow64W8ResolverThunk& operator=(const Wow64W8ResolverThunk&) = delete;
++
++  ~Wow64W8ResolverThunk() override {}
++
++ private:
++  bool IsFunctionAService(void* local_thunk) const override;
++};
++
++// This is the concrete resolver used to perform service-call type functions
++// inside ntdll.dll on Windows 8.
++class Win8ResolverThunk : public ServiceResolverThunk {
++ public:
++  // The service resolver needs a child process to write to.
++  Win8ResolverThunk(HANDLE process, bool relaxed)
++      : ServiceResolverThunk(process, relaxed) {}
++
++  Win8ResolverThunk(const Win8ResolverThunk&) = delete;
++  Win8ResolverThunk& operator=(const Win8ResolverThunk&) = delete;
++
++  ~Win8ResolverThunk() override {}
++
++ private:
++  bool IsFunctionAService(void* local_thunk) const override;
++};
++
++// This is the concrete resolver used to perform service-call type functions
++// inside ntdll.dll on WOW64 for Windows 10.
++class Wow64W10ResolverThunk : public ServiceResolverThunk {
++ public:
++  // The service resolver needs a child process to write to.
++  Wow64W10ResolverThunk(HANDLE process, bool relaxed)
++      : ServiceResolverThunk(process, relaxed) {}
++
++  Wow64W10ResolverThunk(const Wow64W10ResolverThunk&) = delete;
++  Wow64W10ResolverThunk& operator=(const Wow64W10ResolverThunk&) = delete;
++
++  ~Wow64W10ResolverThunk() override {}
++
++ private:
++  bool IsFunctionAService(void* local_thunk) const override;
++};
++
+ }  // namespace sandbox
+ 
+ #endif  // SANDBOX_WIN_SRC_SERVICE_RESOLVER_H_
+diff --git a/sandbox/win/src/service_resolver_32.cc b/sandbox/win/src/service_resolver_32.cc
+index 7f6bf39c6e17b..0c84a6c0af207 100644
+--- a/sandbox/win/src/service_resolver_32.cc
++++ b/sandbox/win/src/service_resolver_32.cc
+@@ -13,22 +13,54 @@
+ #include "base/compiler_specific.h"
+ #include "base/containers/heap_array.h"
+ 
++#ifdef UNSAFE_BUFFERS_BUILD
++// TODO(crbug.com/351564777): Remove this and convert code to safer constructs.
++#pragma allow_unsafe_buffers
++#endif
++
+ namespace {
+ #pragma pack(push, 1)
+ 
+ const BYTE kMovEax = 0xB8;
+ const BYTE kMovEdx = 0xBA;
+ const USHORT kMovEdxEsp = 0xD48B;
++const USHORT kCallPtrEdx = 0x12FF;
+ const USHORT kCallEdx = 0xD2FF;
+ const BYTE kCallEip = 0xE8;
+ const BYTE kRet = 0xC2;
+ const BYTE kRet2 = 0xC3;
+ const USHORT kJmpEdx = 0xE2FF;
++const USHORT kXorEcx = 0xC933;
++const ULONG kLeaEdx = 0x0424548D;
++const ULONG kCallFs1 = 0xC015FF64;
++const USHORT kCallFs2 = 0;
++const BYTE kCallFs3 = 0;
++const BYTE kAddEsp1 = 0x83;
++const USHORT kAddEsp2 = 0x4C4;
+ const BYTE kJmp32 = 0xE9;
+ const USHORT kSysenter = 0x340F;
+ 
+-// Service code for 32 bit Windows. Introduced in Windows 8.
+-struct ServiceEntry32 {
++// Service code for 32 bit systems.
++// NOTE: on win2003 "call dword ptr [edx]" is "call edx".
++struct ServiceEntry {
++  // This struct contains roughly the following code:
++  // 00 mov     eax,25h
++  // 05 mov     edx,offset SharedUserData!SystemCallStub (7ffe0300)
++  // 0a call    dword ptr [edx]
++  // 0c ret     2Ch
++  // 0f nop
++  BYTE mov_eax;         // = B8
++  ULONG service_id;
++  BYTE mov_edx;         // = BA
++  ULONG stub;
++  USHORT call_ptr_edx;  // = FF 12
++  BYTE ret;             // = C2
++  USHORT num_params;
++  BYTE nop;
++};
++
++// Service code for 32 bit Windows 8.
++struct ServiceEntryW8 {
+   // This struct contains the following code:
+   // 00 b825000000      mov     eax,25h
+   // 05 e803000000      call    eip+3
+@@ -49,9 +81,56 @@ struct ServiceEntry32 {
+   USHORT nop;
+ };
+ 
+-// Service code for a 32 bit process under Wow64. Introduced in Windows 10.
+-// Also used for the patching process.
+-struct ServiceEntryWow64 {
++// Service code for a 32 bit process running on a 64 bit os.
++struct Wow64Entry {
++  // This struct may contain one of two versions of code:
++  // 1. For XP, Vista and 2K3:
++  // 00 b825000000      mov     eax, 25h
++  // 05 33c9            xor     ecx, ecx
++  // 07 8d542404        lea     edx, [esp + 4]
++  // 0b 64ff15c0000000  call    dword ptr fs:[0C0h]
++  // 12 c22c00          ret     2Ch
++  //
++  // 2. For Windows 7:
++  // 00 b825000000      mov     eax, 25h
++  // 05 33c9            xor     ecx, ecx
++  // 07 8d542404        lea     edx, [esp + 4]
++  // 0b 64ff15c0000000  call    dword ptr fs:[0C0h]
++  // 12 83c404          add     esp, 4
++  // 15 c22c00          ret     2Ch
++  //
++  // So we base the structure on the bigger one:
++  BYTE mov_eax;         // = B8
++  ULONG service_id;
++  USHORT xor_ecx;       // = 33 C9
++  ULONG lea_edx;        // = 8D 54 24 04
++  ULONG call_fs1;       // = 64 FF 15 C0
++  USHORT call_fs2;      // = 00 00
++  BYTE call_fs3;        // = 00
++  BYTE add_esp1;        // = 83             or ret
++  USHORT add_esp2;      // = C4 04          or num_params
++  BYTE ret;             // = C2
++  USHORT num_params;
++};
++
++// Service code for a 32 bit process running on 64 bit Windows 8.
++struct Wow64EntryW8 {
++  // 00 b825000000      mov     eax, 25h
++  // 05 64ff15c0000000  call    dword ptr fs:[0C0h]
++  // 0b c22c00          ret     2Ch
++  // 0f 90              nop
++  BYTE mov_eax;         // = B8
++  ULONG service_id;
++  ULONG call_fs1;       // = 64 FF 15 C0
++  USHORT call_fs2;      // = 00 00
++  BYTE call_fs3;        // = 00
++  BYTE ret;             // = C2
++  USHORT num_params;
++  BYTE nop;
++};
++
++// Service code for a 32 bit process running on 64 bit Windows 10.
++struct Wow64EntryW10 {
+   // 00 b828000000      mov     eax, 28h
+   // 05 bab0d54877      mov     edx, 7748D5B0h
+   // 09 ffd2            call    edx
+@@ -67,22 +146,22 @@ struct ServiceEntryWow64 {
+ };
+ 
+ // Make sure that relaxed patching works as expected.
+-const size_t kMinServiceSize = offsetof(ServiceEntryWow64, ret);
++const size_t kMinServiceSize = offsetof(ServiceEntry, ret);
+ // Maximum size of the entry, was the size of the Windows Vista WoW64 entry.
+ // Keep this fixed for compatibility reasons.
+ const size_t kMaxServiceSize = 24;
+-static_assert(sizeof(ServiceEntry32) >= kMinServiceSize,
++static_assert(sizeof(ServiceEntry) >= kMinServiceSize,
+               "wrong minimum service length");
+-static_assert(sizeof(ServiceEntry32) < kMaxServiceSize,
++static_assert(sizeof(ServiceEntry) < kMaxServiceSize,
+               "wrong maximum service length");
+-static_assert(sizeof(ServiceEntryWow64) >= kMinServiceSize,
++static_assert(sizeof(Wow64Entry) >= kMinServiceSize,
+               "wrong minimum service length");
+-static_assert(sizeof(ServiceEntryWow64) < kMaxServiceSize,
++static_assert(sizeof(Wow64Entry) <= kMaxServiceSize,
+               "wrong maximum service length");
+ 
+ struct ServiceFullThunk {
+   union {
+-    ServiceEntryWow64 original;
++    Wow64Entry original;
+     // Pad the entry to the maximum size.
+     char dummy[kMaxServiceSize];
+   };
+@@ -91,58 +170,6 @@ struct ServiceFullThunk {
+ 
+ #pragma pack(pop)
+ 
+-bool IsWow64Process() {
+-  // We don't need to use IsWow64Process2 as this returns the expected result
+-  // when running in the ARM64 x86 emulator.
+-  BOOL is_wow64 = FALSE;
+-  return ::IsWow64Process(::GetCurrentProcess(), &is_wow64) && is_wow64;
+-}
+-
+-bool IsFunctionAService32(HANDLE process, void* target, void* local_thunk) {
+-  ServiceEntry32 function_code;
+-  SIZE_T read;
+-  if (!::ReadProcessMemory(process, target, &function_code,
+-                           sizeof(function_code), &read)) {
+-    return false;
+-  }
+-
+-  if (sizeof(function_code) != read)
+-    return false;
+-
+-  if (kMovEax != function_code.mov_eax || kCallEip != function_code.call_eip ||
+-      function_code.call_offset != 3 || kRet != function_code.ret_p ||
+-      kMovEdxEsp != function_code.mov_edx_esp ||
+-      kSysenter != function_code.sysenter || kRet2 != function_code.ret) {
+-    return false;
+-  }
+-
+-  // Save the verified code
+-  UNSAFE_TODO(memcpy(local_thunk, &function_code, sizeof(function_code)));
+-
+-  return true;
+-}
+-
+-bool IsFunctionAServiceWow64(HANDLE process, void* target, void* local_thunk) {
+-  ServiceEntryWow64 function_code;
+-  SIZE_T read;
+-  if (!::ReadProcessMemory(process, target, &function_code,
+-                           sizeof(function_code), &read)) {
+-    return false;
+-  }
+-
+-  if (sizeof(function_code) != read)
+-    return false;
+-
+-  if (kMovEax != function_code.mov_eax || kMovEdx != function_code.mov_edx ||
+-      kCallEdx != function_code.call_edx || kRet != function_code.ret) {
+-    return false;
+-  }
+-
+-  // Save the verified code
+-  UNSAFE_TODO(memcpy(local_thunk, &function_code, sizeof(function_code)));
+-  return true;
+-}
+-
+ }  // namespace
+ 
+ namespace sandbox {
+@@ -209,14 +236,69 @@ NTSTATUS ServiceResolverThunk::CopyThunk(const void* target_module,
+ }
+ 
+ bool ServiceResolverThunk::IsFunctionAService(void* local_thunk) const {
+-  static bool is_wow64 = IsWow64Process();
+-  return is_wow64 ? IsFunctionAServiceWow64(process_, target_, local_thunk)
+-                  : IsFunctionAService32(process_, target_, local_thunk);
++  ServiceEntry function_code;
++  SIZE_T read;
++  if (!::ReadProcessMemory(process_, target_, &function_code,
++                           sizeof(function_code), &read)) {
++    return false;
++  }
++
++  if (sizeof(function_code) != read)
++    return false;
++
++  if (kMovEax != function_code.mov_eax || kMovEdx != function_code.mov_edx ||
++      (kCallPtrEdx != function_code.call_ptr_edx &&
++       kCallEdx != function_code.call_ptr_edx) ||
++      kRet != function_code.ret) {
++    return false;
++  }
++
++  // Find the system call pointer if we don't already have it.
++  if (kCallEdx != function_code.call_ptr_edx) {
++    DWORD ki_system_call;
++    if (!::ReadProcessMemory(process_,
++                             reinterpret_cast<const void*>(function_code.stub),
++                             &ki_system_call, sizeof(ki_system_call), &read)) {
++      return false;
++    }
++
++    if (sizeof(ki_system_call) != read)
++      return false;
++
++    HMODULE module_1, module_2;
++    // last check, call_stub should point to a KiXXSystemCall function on ntdll
++    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           reinterpret_cast<const wchar_t*>(ki_system_call),
++                           &module_1)) {
++      return false;
++    }
++
++    if (ntdll_base_) {
++      // This path is only taken when running the unit tests. We want to be
++      // able to patch a buffer in memory, so target_ is not inside ntdll.
++      module_2 = ntdll_base_;
++    } else {
++      if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                             reinterpret_cast<const wchar_t*>(target_),
++                             &module_2))
++        return false;
++    }
++
++    if (module_1 != module_2)
++      return false;
++  }
++
++  // Save the verified code
++  memcpy(local_thunk, &function_code, sizeof(function_code));
++
++  return true;
+ }
+ 
+ NTSTATUS ServiceResolverThunk::PerformPatch(void* local_thunk,
+                                             void* remote_thunk) {
+-  ServiceEntryWow64 intercepted_code;
++  ServiceEntry intercepted_code;
+   size_t bytes_to_write = sizeof(intercepted_code);
+   ServiceFullThunk* full_local_thunk =
+       reinterpret_cast<ServiceFullThunk*>(local_thunk);
+@@ -229,15 +311,15 @@ NTSTATUS ServiceResolverThunk::PerformPatch(void* local_thunk,
+   intercepted_code.mov_eax = kMovEax;
+   intercepted_code.service_id = full_local_thunk->original.service_id;
+   intercepted_code.mov_edx = kMovEdx;
+-  intercepted_code.mov_edx_param =
+-      reinterpret_cast<ULONG>(&full_remote_thunk->internal_thunk);
+-  intercepted_code.call_edx = kJmpEdx;
++  intercepted_code.stub =
++       reinterpret_cast<ULONG>(&full_remote_thunk->internal_thunk);
++  intercepted_code.call_ptr_edx = kJmpEdx;
+   bytes_to_write = kMinServiceSize;
+ 
+   if (relative_jump_) {
+     intercepted_code.mov_eax = kJmp32;
+     intercepted_code.service_id = relative_jump_;
+-    bytes_to_write = offsetof(ServiceEntryWow64, mov_edx);
++    bytes_to_write = offsetof(ServiceEntry, mov_edx);
+   }
+ 
+   // setup the thunk
+@@ -273,7 +355,7 @@ NTSTATUS ServiceResolverThunk::PerformPatch(void* local_thunk,
+ 
+ bool ServiceResolverThunk::SaveOriginalFunction(void* local_thunk,
+                                                 void* remote_thunk) {
+-  ServiceEntryWow64 function_code;
++  ServiceEntry function_code;
+   SIZE_T read;
+   if (!::ReadProcessMemory(process_, target_, &function_code,
+                            sizeof(function_code), &read)) {
+@@ -309,18 +391,98 @@ bool ServiceResolverThunk::SaveOriginalFunction(void* local_thunk,
+   return true;
+ }
+ 
+-bool ServiceResolverThunk::VerifyJumpTargetForTesting(
+-    void* thunk_storage) const {
+-  const size_t kJmp32Size = 5;
+-  ServiceEntryWow64* patched = static_cast<ServiceEntryWow64*>(target_);
+-  if (kJmp32 != patched->mov_eax) {
++bool Wow64ResolverThunk::IsFunctionAService(void* local_thunk) const {
++  Wow64Entry function_code;
++  SIZE_T read;
++  if (!::ReadProcessMemory(process_, target_, &function_code,
++                           sizeof(function_code), &read)) {
++    return false;
++  }
++
++  if (sizeof(function_code) != read)
++     return false;
++
++  if (kMovEax != function_code.mov_eax || kXorEcx != function_code.xor_ecx ||
++      kLeaEdx != function_code.lea_edx || kCallFs1 != function_code.call_fs1 ||
++      kCallFs2 != function_code.call_fs2 ||
++      kCallFs3 != function_code.call_fs3) {
++    return false;
++  }
++
++  if ((kAddEsp1 == function_code.add_esp1 &&
++       kAddEsp2 == function_code.add_esp2 && kRet == function_code.ret) ||
++      kRet == function_code.add_esp1) {
++    // Save the verified code
++    memcpy(local_thunk, &function_code, sizeof(function_code));
++    return true;
++   }
++  return false;
++}
++bool Wow64W8ResolverThunk::IsFunctionAService(void* local_thunk) const {
++  Wow64EntryW8 function_code;
++  SIZE_T read;
++  if (!::ReadProcessMemory(process_, target_, &function_code,
++                           sizeof(function_code), &read)) {
++    return false;
++  }
++
++if (sizeof(function_code) != read)
++    return false;
++
++  if (kMovEax != function_code.mov_eax || kCallFs1 != function_code.call_fs1 ||
++      kCallFs2 != function_code.call_fs2 ||
++      kCallFs3 != function_code.call_fs3 || kRet != function_code.ret) {
++    return false;
++  }
++
++  // Save the verified code
++  memcpy(local_thunk, &function_code, sizeof(function_code));
++  return true;
++}
++
++bool Win8ResolverThunk::IsFunctionAService(void* local_thunk) const {
++  ServiceEntryW8 function_code;
++  SIZE_T read;
++  if (!::ReadProcessMemory(process_, target_, &function_code,
++                           sizeof(function_code), &read)) {
++    return false;
++  }
++
++  if (sizeof(function_code) != read)
++    return false;
++
++  if (kMovEax != function_code.mov_eax || kCallEip != function_code.call_eip ||
++      function_code.call_offset != 3 || kRet != function_code.ret_p ||
++      kMovEdxEsp != function_code.mov_edx_esp ||
++      kSysenter != function_code.sysenter || kRet2 != function_code.ret) {
+     return false;
+   }
+ 
+-  ULONG source_addr = reinterpret_cast<ULONG>(target_);
+-  ULONG target_addr = reinterpret_cast<ULONG>(thunk_storage);
+-  return target_addr + kMaxServiceSize - kJmp32Size - source_addr ==
+-         patched->service_id;
++  // Save the verified code
++  memcpy(local_thunk, &function_code, sizeof(function_code));
++
++  return true;
+ }
+ 
++bool Wow64W10ResolverThunk::IsFunctionAService(void* local_thunk) const {
++  Wow64EntryW10 function_code;
++  SIZE_T read;
++  if (!::ReadProcessMemory(process_, target_, &function_code,
++                           sizeof(function_code), &read)) {
++    return false;
++  }
++
++  if (sizeof(function_code) != read)
++    return false;
++
++  if (kMovEax != function_code.mov_eax || kMovEdx != function_code.mov_edx ||
++      kCallEdx != function_code.call_edx || kRet != function_code.ret) {
++    return false;
++  }
++
++  // Save the verified code
++  memcpy(local_thunk, &function_code, sizeof(function_code));
++  return true;
++ }
++
+ }  // namespace sandbox
+diff --git a/sandbox/win/src/win_utils.cc b/sandbox/win/src/win_utils.cc
+index fc425d23651e5..6c2f4c6ecc454 100644
+--- a/sandbox/win/src/win_utils.cc
++++ b/sandbox/win/src/win_utils.cc
+@@ -151,6 +151,36 @@ DWORD GetLastErrorFromNtStatus(NTSTATUS status) {
+   return GetNtExports()->RtlNtStatusToDosError(status);
+ }
+ 
++std::optional<ProcessHandleMap> GetCurrentProcessHandlesWin7() {
++  DWORD handle_count = UINT_MAX;
++  const int kInvalidHandleThreshold = 100;
++  const size_t kHandleOffset = 4;  // Handles are always a multiple of 4.
++
++  if (!::GetProcessHandleCount(::GetCurrentProcess(), &handle_count))
++    return std::nullopt;
++  ProcessHandleMap handle_map;
++
++  uint32_t handle_value = 0;
++  int invalid_count = 0;
++
++  // Keep incrementing until we hit the number of handles reported by
++  // GetProcessHandleCount(). If we hit a very long sequence of invalid
++  // handles we assume that we've run past the end of the table.
++  while (handle_count && invalid_count < kInvalidHandleThreshold) {
++    handle_value += kHandleOffset;
++    HANDLE handle = base::win::Uint32ToHandle(handle_value);
++    auto type_name = GetTypeNameFromHandle(handle);
++    if (!type_name) {
++      ++invalid_count;
++      continue;
++    }
++
++    --handle_count;
++    handle_map[type_name.value()].push_back(handle);
++  }
++  return handle_map;
++}
++
+ bool ContainsNulCharacter(std::wstring_view str) {
+   wchar_t nul = '\0';
+   return str.find_first_of(nul) != std::wstring::npos;
+diff --git a/sandbox/win/src/win_utils.h b/sandbox/win/src/win_utils.h
+index 6c6faeef88a57..92939ac5e6096 100644
+--- a/sandbox/win/src/win_utils.h
++++ b/sandbox/win/src/win_utils.h
+@@ -8,10 +8,12 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ 
++#include <map>
+ #include <memory>
+ #include <optional>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ #include "base/containers/span.h"
+ #include "base/win/windows_types.h"
+@@ -21,6 +23,9 @@ namespace sandbox {
+ // Prefix for path used by NT calls.
+ const wchar_t kNTPrefix[] = L"\\??\\";
+ 
++// List of handles mapped to their kernel object type name.
++using ProcessHandleMap = std::map<std::wstring, std::vector<HANDLE>>;
++
+ // Basic implementation of a singleton which calls the destructor
+ // when the exe is shutting down or the DLL is being unloaded.
+ template <typename Derived>
+@@ -68,6 +73,11 @@ bool IsPipe(const std::wstring& path);
+ // Converts a NTSTATUS code to a Win32 error code.
+ DWORD GetLastErrorFromNtStatus(NTSTATUS status);
+ 
++// Fallback function for GetCurrentProcessHandles. Should only be needed on
++// Windows 7 which doesn't support the API to query all process handles. This
++// uses a brute force method to get the process handles.
++std::optional<ProcessHandleMap> GetCurrentProcessHandlesWin7();
++
+ // Returns true if the string contains a NUL ('\0') character.
+ bool ContainsNulCharacter(std::wstring_view str);
+ 
+ 

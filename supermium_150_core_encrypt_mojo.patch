@@ -1,0 +1,237 @@
+diff --git a/base/process/launch_win.cc b/base/process/launch_win.cc
+index f1392713e4376..f2167d46e81a0 100644
+--- a/base/process/launch_win.cc
++++ b/base/process/launch_win.cc
+@@ -293,7 +293,7 @@ Process LaunchProcess(const CommandLine::StringType& cmdline,
+   }
+ 
+   // Count PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+-  if (!options.handles_to_inherit.empty()) {
++  if (!options.handles_to_inherit.empty() && base::win::GetVersion() >= base::win::Version::VISTA) {
+     ++attribute_count;
+   }
+ 
+@@ -322,7 +322,11 @@ Process LaunchProcess(const CommandLine::StringType& cmdline,
+ 
+   // Set PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+   bool inherit_handles = options.inherit_mode == LaunchOptions::Inherit::kAll;
+-  if (!options.handles_to_inherit.empty()) {
++  if (!options.handles_to_inherit.empty() &&
++	  base::win::GetVersion() < base::win::Version::VISTA) {
++	  inherit_handles = true;
++  }
++  if (!options.handles_to_inherit.empty() && base::win::GetVersion() >= base::win::Version::VISTA) {
+     DCHECK_GT(attribute_count, 0u);
+     DCHECK_EQ(options.inherit_mode, LaunchOptions::Inherit::kSpecific);
+ 
+diff --git a/base/process/process_metrics_win.cc b/base/process/process_metrics_win.cc
+index 3a0400b75aeee..e402bb1f84a9f 100644
+--- a/base/process/process_metrics_win.cc
++++ b/base/process/process_metrics_win.cc
+@@ -226,7 +226,7 @@ ProcessMetrics::ProcessMetrics(ProcessHandle process) {
+   HANDLE duplicate_handle = INVALID_HANDLE_VALUE;
+   BOOL result = ::DuplicateHandle(::GetCurrentProcess(), process,
+                                   ::GetCurrentProcess(), &duplicate_handle,
+-                                  PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0);
++                                  PROCESS_QUERY_INFORMATION, FALSE, 0);
+   if (!result) {
+     // Even with PROCESS_QUERY_LIMITED_INFORMATION, DuplicateHandle can fail
+     // with ERROR_ACCESS_DENIED. And it's always possible to run out of handles.
+diff --git a/base/system/sys_info_win.cc b/base/system/sys_info_win.cc
+index ba704438084af..034ab3f717d20 100644
+--- a/base/system/sys_info_win.cc
++++ b/base/system/sys_info_win.cc
+@@ -137,6 +137,10 @@ int SysInfo::NumberOfProcessors() {
+ 
+ // static
+ int SysInfo::NumberOfEfficientProcessorsImpl() {
++  // No efficiency support before Windows 10.
++  if (win::GetVersion() < win::Version::WIN10)
++	  return 0;
++
+   std::vector<BYTE> efficiency_classes = GetCoreEfficiencyClasses();
+   if (efficiency_classes.empty()) {
+     return 0;
+diff --git a/chrome/browser/os_crypt/app_bound_encryption_provider_win.cc b/chrome/browser/os_crypt/app_bound_encryption_provider_win.cc
+index 45e91f10d8139..5447a79a1fd78 100644
+--- a/chrome/browser/os_crypt/app_bound_encryption_provider_win.cc
++++ b/chrome/browser/os_crypt/app_bound_encryption_provider_win.cc
+@@ -19,6 +19,7 @@
+ #include "base/task/task_traits.h"
+ #include "base/task/thread_pool.h"
+ #include "base/types/expected.h"
++#include "base/win/windows_version.h"
+ #include "chrome/browser/os_crypt/app_bound_encryption_win.h"
+ #include "components/crash/core/common/crash_key.h"
+ #include "components/os_crypt/async/common/algorithm.mojom.h"
+@@ -259,7 +260,8 @@ void AppBoundEncryptionProviderWin::GenerateAndPersistNewKeyInternal(
+ 
+ bool AppBoundEncryptionProviderWin::UseForEncryption() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return support_level_ == os_crypt::SupportLevel::kSupported;
++  return support_level_ == os_crypt::SupportLevel::kSupported
++                           && base::win::GetVersion() >= base::win::Version::WIN10;
+ }
+ 
+ bool AppBoundEncryptionProviderWin::IsCompatibleWithOsCryptSync() {
+diff --git a/components/system_cpu/cpu_probe_win.cc b/components/system_cpu/cpu_probe_win.cc
+index 1a11bf5c4c3e5..85bf43935ed6c 100644
+--- a/components/system_cpu/cpu_probe_win.cc
++++ b/components/system_cpu/cpu_probe_win.cc
+@@ -92,7 +92,7 @@ std::optional<CpuSample> CpuProbeWin::BlockingTaskRunnerHelper::Update() {
+     const auto* query_info = is_running_in_vm
+                                  ? kHypervisorLogicalProcessorCounter
+                                  : kProcessorCounter;
+-    pdh_status = PdhAddEnglishCounter(cpu_query_.get(), query_info, NULL,
++    pdh_status = PdhAddCounter(cpu_query_.get(), query_info, NULL,
+                                       &cpu_percent_utilization_);
+ 
+     // When Chrome is running under a different hypervisor, we can add the
+@@ -102,14 +102,14 @@ std::optional<CpuSample> CpuProbeWin::BlockingTaskRunnerHelper::Update() {
+       pdh_status = PdhCollectQueryData(cpu_query_.get());
+       if (pdh_status != ERROR_SUCCESS) {
+         query_info = kProcessorCounter;
+-        pdh_status = PdhAddEnglishCounter(cpu_query_.get(), query_info, NULL,
++        pdh_status = PdhAddCounter(cpu_query_.get(), query_info, NULL,
+                                           &cpu_percent_utilization_);
+       }
+     }
+ 
+     if (pdh_status != ERROR_SUCCESS) {
+       cpu_query_.reset();
+-      LOG(ERROR) << "PdhAddEnglishCounter failed for '" << query_info
++      LOG(ERROR) << "PdhAddCounter failed for '" << query_info
+                  << "': " << logging::SystemErrorCodeToString(pdh_status);
+       return std::nullopt;
+     }
+diff --git a/components/update_client/background_downloader_win.cc b/components/update_client/background_downloader_win.cc
+index 517cab62f9ba0..2e0f4cf1e540b 100644
+--- a/components/update_client/background_downloader_win.cc
++++ b/components/update_client/background_downloader_win.cc
+@@ -423,6 +423,8 @@ void CleanupJob(const Microsoft::WRL::ComPtr<IBackgroundCopyJob>& job) {
+ }
+ 
+ void CheckIsMta() {
++  // Enforce this as set.
++  ::CoInitializeEx(NULL, COINIT_MULTITHREADED);
+   CHECK_EQ(base::win::GetComApartmentTypeForThread(),
+            base::win::ComApartmentType::MTA);
+ }
+diff --git a/crypto/process_bound_string.cc b/crypto/process_bound_string.cc
+index 3d60dd10ba60e..eba4278704734 100644
+--- a/crypto/process_bound_string.cc
++++ b/crypto/process_bound_string.cc
+@@ -14,6 +14,7 @@
+ 
+ #include "base/process/memory.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/win/windows_version.h"
+ #else
+ #include "third_party/boringssl/src/include/openssl/mem.h"
+ #endif  // BUILDFLAG(IS_WIN)
+@@ -42,7 +43,8 @@ size_t MaybeRoundUp(size_t size) {
+ bool MaybeEncryptBuffer(base::span<uint8_t> buffer) {
+ #if BUILDFLAG(IS_WIN)
+   TRACE_EVENT0(kTraceCategory, "ProcessBoundString::EncryptBuffer");
+-  if (::CryptProtectMemory(buffer.data(), buffer.size(),
++  if (base::win::GetVersion() > base::win::Version::XP &&
++      ::CryptProtectMemory(buffer.data(), buffer.size(),
+                            CRYPTPROTECTMEMORY_SAME_PROCESS)) {
+     return true;
+   }
+@@ -53,7 +55,8 @@ bool MaybeEncryptBuffer(base::span<uint8_t> buffer) {
+ bool MaybeDecryptBuffer(base::span<uint8_t> buffer) {
+ #if BUILDFLAG(IS_WIN)
+   TRACE_EVENT0(kTraceCategory, "ProcessBoundString::DecryptBuffer");
+-  if (::CryptUnprotectMemory(buffer.data(), buffer.size(),
++  if (base::win::GetVersion() > base::win::Version::XP &&
++      ::CryptUnrotectMemory(buffer.data(), buffer.size(),
+                              CRYPTPROTECTMEMORY_SAME_PROCESS)) {
+     return true;
+   }
+diff --git a/crypto/unexportable_key_win.cc b/crypto/unexportable_key_win.cc
+index 64ad2bdb88203..e9a650a686752 100644
+--- a/crypto/unexportable_key_win.cc
++++ b/crypto/unexportable_key_win.cc
+@@ -617,6 +617,11 @@ class UnexportableKeyProviderWin : public UnexportableKeyProvider {
+     ScopedNCryptProvider provider;
+     {
+       SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY();
++
++      if(!::LoadLibraryW(L"ncrypt.dll")) {
++          return std::nullopt;
++      }
++
+       SECURITY_STATUS status = NCryptOpenStorageProvider(
+           ScopedNCryptProvider::Receiver(provider).get(),
+           GetWindowsIdentifierForProvider(provider_type_), /*flags=*/0);
+@@ -641,6 +646,11 @@ class UnexportableKeyProviderWin : public UnexportableKeyProvider {
+     ScopedNCryptProvider provider;
+     {
+       SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY();
++
++      if(!::LoadLibraryW(L"ncrypt.dll")) {
++          return std::nullopt;
++      }
++
+       SECURITY_STATUS status = NCryptOpenStorageProvider(
+           ScopedNCryptProvider::Receiver(provider).get(),
+           GetWindowsIdentifierForProvider(provider_type_), /*flags=*/0);
+@@ -933,6 +943,11 @@ class VirtualUnexportableKeyProviderWin
+     ScopedNCryptProvider provider;
+     {
+       SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY();
++
++      if(!::LoadLibraryW(L"ncrypt.dll")) {
++          return std::nullopt;
++      }
++
+       SECURITY_STATUS status = NCryptOpenStorageProvider(
+           ScopedNCryptProvider::Receiver(provider).get(),
+           MS_KEY_STORAGE_PROVIDER, /*dwFlags=*/0);
+@@ -955,6 +970,11 @@ class VirtualUnexportableKeyProviderWin
+     ScopedNCryptProvider provider;
+     {
+       SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY();
++
++      if(!::LoadLibraryW(L"ncrypt.dll")) {
++          return nullptr;
++      }
++
+       SECURITY_STATUS status = NCryptOpenStorageProvider(
+           ScopedNCryptProvider::Receiver(provider).get(),
+           MS_KEY_STORAGE_PROVIDER, /*dwFlags=*/0);
+diff --git a/mojo/core/embedder/embedder.cc b/mojo/core/embedder/embedder.cc
+index 2a53e85121870..a3d6cf4f2ba6e 100644
+--- a/mojo/core/embedder/embedder.cc
++++ b/mojo/core/embedder/embedder.cc
+@@ -42,6 +42,10 @@
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) ||
+         // BUILDFLAG(IS_ANDROID)
+ 
++#if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
++#endif
++
+ namespace mojo::core {
+ 
+ namespace {
+@@ -107,7 +111,16 @@ void InitFeatures() {
+ 
+ void EnableMojoIpcz() {
+ #if BUILDFLAG(MOJO_SUPPORT_LEGACY_CORE)
+-  g_mojo_ipcz_enabled.store(true, std::memory_order_release);
++#if BUILDFLAG(IS_WIN)
++  // TODO(https://crbug.com/1299283): Sandboxed processes on Windows versions
++  // older than 8.1 require some extra (not yet implemented... err... never implemented) setup for ipcz to
++  // work properly. This is omitted for early experimentation.
++  const bool kIsIpczSupported =
++      base::win::GetVersion() >= base::win::Version::WIN8_1;
++#else
++  const bool kIsIpczSupported = true;
++#endif
++  g_mojo_ipcz_enabled.store(kIsIpczSupported, std::memory_order_release);
+ #endif
+ }
+ 
+ 

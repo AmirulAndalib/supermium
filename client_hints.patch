@@ -1,0 +1,264 @@
+diff --git a/third_party/blink/common/client_hints/enabled_client_hints.cc b/third_party/blink/common/client_hints/enabled_client_hints.cc
+index 2f000524c5207..cf44f80bf5e24 100644
+--- a/third_party/blink/common/client_hints/enabled_client_hints.cc
++++ b/third_party/blink/common/client_hints/enabled_client_hints.cc
+@@ -26,7 +26,13 @@ bool IsDisabledByFeature(const WebClientHintsType type) {
+     case WebClientHintsType::kUAFullVersionList:
+     case WebClientHintsType::kUABitness:
+     case WebClientHintsType::kUAWoW64:
++      if (base::FeatureList::IsEnabled(features::kRemoveClientHints))
++        return true;
++      break;
+     case WebClientHintsType::kUAFormFactors:
++      if (base::FeatureList::IsEnabled(features::kRemoveClientHints))
++         return true;
++      break;
+     case WebClientHintsType::kPrefersColorScheme:
+     case WebClientHintsType::kViewportHeight:
+     case WebClientHintsType::kDeviceMemory:
+diff --git a/third_party/blink/common/features.cc b/third_party/blink/common/features.cc
+index 1c03e395d86fa..fc2d78d5cc9f0 100644
+--- a/third_party/blink/common/features.cc
++++ b/third_party/blink/common/features.cc
+@@ -2785,6 +2785,9 @@ BASE_FEATURE(kWorkerThreadRespectTermRequest, base::FEATURE_ENABLED_BY_DEFAULT);
+ // Enables certain features which are not needed on other platforms.
+ BASE_FEATURE(kXrDevice, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++// Disable user agent client hints at the renderer level.
++BASE_FEATURE(kRemoveClientHints, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ // Enable the 'unframed' display override for IWAs. go/unframed-explainer-doc.
+ BASE_FEATURE(kUnframedIwa, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+diff --git a/third_party/blink/public/common/features.h b/third_party/blink/public/common/features.h
+index 1818562aeec42..b463f2cb7fd57 100644
+--- a/third_party/blink/public/common/features.h
++++ b/third_party/blink/public/common/features.h
+@@ -48,6 +48,9 @@ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kAdAuctionSignals);
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE_PARAM(int,
+                                                kAdAuctionSignalsMaxSizeBytes);
+ 
++// Disable User Agent Client Hints.
++BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kRemoveClientHints);
++
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kAudioWorkletJSDenormalEnabler);
+ 
+ // Avoids copying ResourceRequest::TrustedParams when possible.
+diff --git a/third_party/blink/renderer/core/frame/navigator_ua.cc b/third_party/blink/renderer/core/frame/navigator_ua.cc
+index 22483bb57adf7..5d2158e137d42 100644
+--- a/third_party/blink/renderer/core/frame/navigator_ua.cc
++++ b/third_party/blink/renderer/core/frame/navigator_ua.cc
+@@ -5,6 +5,7 @@
+ #include "third_party/blink/renderer/core/frame/navigator_ua.h"
+ 
+ #include "base/compiler_specific.h"
++#include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ #include "third_party/blink/renderer/core/frame/navigator_ua_data.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+@@ -12,6 +13,8 @@
+ namespace blink {
+ 
+ NavigatorUAData* NavigatorUA::userAgentData() {
++ if (base::FeatureList::IsEnabled(blink::features::kRemoveClientHints))
++    return nullptr;
+   NavigatorUAData* ua_data =
+       MakeGarbageCollected<NavigatorUAData>(GetUAExecutionContext());
+ 
+diff --git a/third_party/blink/renderer/platform/loader/fetch/client_hints_preferences.cc b/third_party/blink/renderer/platform/loader/fetch/client_hints_preferences.cc
+index 8a0cc9e0f340e..5a2e279b1f3be 100644
+--- a/third_party/blink/renderer/platform/loader/fetch/client_hints_preferences.cc
++++ b/third_party/blink/renderer/platform/loader/fetch/client_hints_preferences.cc
+@@ -5,10 +5,12 @@
+ #include "third_party/blink/renderer/platform/loader/fetch/client_hints_preferences.h"
+ 
+ #include "base/command_line.h"
++#include "base/feature_list.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "services/network/public/cpp/client_hints.h"
+ #include "services/network/public/cpp/is_potentially_trustworthy.h"
+ #include "third_party/blink/public/common/client_hints/client_hints.h"
++#include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/renderer/platform/network/http_names.h"
+ #include "third_party/blink/renderer/platform/network/http_parsers.h"
+@@ -122,9 +124,10 @@ bool ClientHintsPreferences::IsClientHintsAllowed(const KURL& url) {
+   // TODO(crbug.com/862940): This should probably be using
+   // network::IsUrlPotentiallyTrustworthy() instead of coercing the URL to an
+   // origin first.
+-  return (url.ProtocolIs("http") || url.ProtocolIs("https")) &&
++  return !base::FeatureList::IsEnabled(features::kRemoveClientHints) &&
++        ((url.ProtocolIs("http") || url.ProtocolIs("https")) &&
+          network::IsOriginPotentiallyTrustworthy(
+-             url::Origin::Create(GURL(url)));
++             url::Origin::Create(GURL(url))));
+ }
+ 
+ EnabledClientHints ClientHintsPreferences::GetEnabledClientHints() const {
+diff --git a/third_party/blink/renderer/platform/runtime_enabled_features.json5 b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+index b4ecce05e616d..28a6c7fb1265f 100644
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -1974,6 +1974,10 @@
+       name: "CSSSupportsForImportRules",
+       status: "stable",
+     },
++    {
++      name: "UserAgentClientHint",
++      status: "stable",
++    },
+     {
+       // https://chromestatus.com/feature/5153932394102784
+       // Shipping in M150, so flag can be removed around M152.
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 608bea5cb3864..f933adec2e23d 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -16,8 +16,11 @@
+ #include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/feature_list.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
++#include "base/path_service.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+@@ -26,6 +29,7 @@
+ #include "base/version.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
++#include "chrome/common/chrome_paths.h"
+ #include "components/embedder_support/pref_names.h"
+ #include "components/embedder_support/switches.h"
+ #include "components/policy/core/common/policy_pref_names.h"
+@@ -58,6 +62,59 @@ namespace embedder_support {
+ 
+ namespace {
+ 
++typedef enum UACHSpoofType{
++	UA,
++	UACHCustomName,
++	UACHCustomVersion,
++	UACHCustomFullVersion,
++	UACHCustomPlatform,
++	UACHCustomPlatformVersion,
++	UACHCustomModel,
++	UACHCustomArchitecture,
++	UACHCustomBitness,
++	UACHCustomIsMobile,
++	UACHCustomWOW64
++}UACHSpoofType;
++
++std::vector<std::string> split(const std::string& str, const std::string& delimiter) {
++    std::vector<std::string> tokens;
++    size_t start = 0;
++    size_t end = str.find(delimiter);
++
++    while (end != std::string::npos) {
++        tokens.push_back(str.substr(start, end - start));
++        start = end + delimiter.length();
++        end = str.find(delimiter, start);
++    }
++
++    tokens.push_back(str.substr(start, end - start)); // add the last token
++    return tokens;
++}
++
++// Function to parse the file
++std::string parseFile(UACHSpoofType SpoofTarget) {
++    base::FilePath userdir;
++    if(!base::PathService::Get(chrome::DIR_USER_DATA, &userdir)) {
++        return std::string(); // Things are seriously wrong if the user data directory cannot be located.
++	}
++    const base::FilePath userpath = userdir.Append(FILE_PATH_LITERAL("uao"));
++    std::optional<int64_t> file_size = base::GetFileSize(userpath);
++    if(!file_size.has_value()) {
++        return std::string();
++	}
++    std::vector<char> buf(file_size.value());
++    base::ReadFile(userpath, reinterpret_cast<char*>(buf.data()), file_size.value());
++    std::string bufstr = std::string(reinterpret_cast<char*>(buf.data()));
++
++    std::vector<std::string> fields = split(bufstr, ";;;");
++    if (fields.size() > SpoofTarget) {
++	   return fields[SpoofTarget];
++    } else {
++       LOG(0) << "UAO file invalid; all fields are not present";
++       return std::string();
++    }
++}
++
+ #if BUILDFLAG(IS_WIN)
+ 
+ // The registry key where the UniversalApiContract version value can be read
+@@ -78,7 +135,7 @@ constexpr wchar_t kUniversalApiContractName[] =
+ // to rely on querying the IsApiContractPresentByMajor function used by
+ // user_agent_utils_unittest.cc.
+ const int kHighestKnownUniversalApiContractVersion = 19;
+-
++/*
+ int GetPreRS5UniversalApiContractVersion() {
+   // This calls Kernel32Version() to get the real non-spoofable version (as
+   // opposed to base::win::GetVersion() which as of writing this seems to return
+@@ -107,7 +164,7 @@ int GetPreRS5UniversalApiContractVersion() {
+   // RS5.
+   NOTREACHED();
+ }
+-
++*/
+ // Returns the UniversalApiContract version number, which is available for
+ // Windows versions greater than RS5. Otherwise, returns 0.
+ const std::string& GetUniversalApiContractVersion() {
+@@ -122,7 +179,7 @@ const std::string& GetUniversalApiContractVersion() {
+         int minor_version = 0;
+         if (base::win::OSInfo::Kernel32Version() <=
+             base::win::Version::WIN10_RS4) {
+-          major_version = GetPreRS5UniversalApiContractVersion();
++          major_version = kHighestKnownUniversalApiContractVersion;
+         } else {
+           base::win::RegKey version_key(
+               HKEY_LOCAL_MACHINE, kWindowsRuntimeWellKnownContractsRegKeyName,
+@@ -163,15 +220,27 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+   bool parse_result = base::StringToInt(major_version, &major_version_number);
+   DCHECK(parse_result);
+   std::optional<std::string> brand;
++  std::string custom_brand;
++  custom_brand = parseFile(UACHCustomName);
+ #if !BUILDFLAG(CHROMIUM_BRANDING)
+   brand = version_info::GetProductName();
++#else
++  if (!custom_brand.empty())
++	brand = custom_brand;
++  else
++    brand = std::string("Google Chrome");
+ #endif
+ 
++  std::string custom_brand_version = parseFile(UACHCustomVersion);
+   std::string brand_version =
+       output_version_type == blink::UserAgentBrandVersionType::kFullVersion
+           ? full_version
+           : major_version;
+ 
++  if(!custom_brand_version.empty()){
++	  brand_version = custom_brand_version;
++  }
++
+   return GenerateBrandVersionList(major_version_number, brand, brand_version,
+                                   output_version_type,
+                                   additional_brand_version);
+@@ -468,6 +537,11 @@ std::string GetUserAgent() {
+     return custom_ua.value();
+   }
+ 
++  custom_ua = parseFile(UA);
++  if (!custom_ua->empty()) {
++    return custom_ua.value();
++  }
++
+   return GetUserAgentInternal();
+ }
+ 
+ 

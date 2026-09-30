@@ -1,0 +1,827 @@
+diff --git a/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc b/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc
+index 2f7ea50b69a46..0b63fc4b62c46 100644
+--- a/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc
++++ b/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.h"
+ 
++#include "base/command_line.h"
+ #include "base/notreached.h"
+ #include "base/strings/string_util.h"
+ #include "build/build_config.h"
+@@ -72,7 +73,9 @@ ChromeAutocompleteSchemeClassifier::GetInputTypeForScheme(
+       (ProfileIOData::IsHandledProtocol(scheme) ||
+        base::EqualsCaseInsensitiveASCII(scheme, content::kViewSourceScheme) ||
+        base::EqualsCaseInsensitiveASCII(scheme, url::kJavaScriptScheme) ||
+-       base::EqualsCaseInsensitiveASCII(scheme, url::kDataScheme))) {
++       base::EqualsCaseInsensitiveASCII(scheme, url::kDataScheme) || 
++       (base::EqualsCaseInsensitiveASCII(scheme, url::kTraceScheme) &&
++       base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")))) {
+     return metrics::OmniboxInputType::URL;
+   }
+ 
+diff --git a/chrome/browser/browser_process_impl.cc b/chrome/browser/browser_process_impl.cc
+index 3389caba30366..f699d8b8e463f 100644
+--- a/chrome/browser/browser_process_impl.cc
++++ b/chrome/browser/browser_process_impl.cc
+@@ -119,6 +119,7 @@
+ #include "components/metrics/metrics_service.h"
+ #include "components/metrics_services_manager/metrics_services_manager.h"
+ #include "components/metrics_services_manager/metrics_services_manager_client.h"
++#include "components/network_session_configurator/common/network_switches.h"
+ #include "components/network_time/network_time_tracker.h"
+ #include "components/os_crypt/async/browser/os_crypt_async.h"
+ #include "components/permissions/permissions_client.h"
+@@ -156,6 +157,7 @@
+ #include "extensions/common/constants.h"
+ #include "media/media_buildflags.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "net/socket/client_socket_pool_manager.h"
+ #include "printing/buildflags/buildflags.h"
+ #include "services/network/public/cpp/features.h"
+ #include "services/network/public/cpp/network_switches.h"
+@@ -488,6 +490,18 @@ void BrowserProcessImpl::Init() {
+       metrics::prefs::kMetricsReportingEnabled,
+       base::BindRepeating(&metrics::ApplyMetricsReportingPolicy));
+ 
++  int max_connections_per_host = 0;
++  auto switch_value = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++      "max-connections-per-host");
++  if (!switch_value.empty() && !base::StringToInt(switch_value, &max_connections_per_host)) {
++    LOG(DFATAL) << "--" << "max-connections-per-host"
++      << " expected integer; got (\"" << switch_value << "\" instead)";
++  }
++  if (max_connections_per_host != 0) {
++    net::ClientSocketPoolManager::set_max_sockets_per_group_for_test(
++        net::HttpNetworkSession::SocketPoolType::kNormal, max_connections_per_host);
++  }
++
+ #if BUILDFLAG(IS_WIN)
+   // Pref state is taken from the trusted process isolation state during browser
+   // startup, and reset during each startup. This ensures that even if the pref
+@@ -1743,6 +1757,10 @@ void BrowserProcessImpl::CreateSafeBrowsingService() {
+   // create the service class if there was an error.
+   created_safe_browsing_service_ = true;
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")){
++    return;
++  }
++
+   // The factory can be overridden in tests.
+   if (!safe_browsing::SafeBrowsingServiceInterface::HasFactory()) {
+     safe_browsing::SafeBrowsingServiceInterface::RegisterFactory(
+diff --git a/chrome/browser/domain_reliability/service_factory.cc b/chrome/browser/domain_reliability/service_factory.cc
+index e3f85943ed5b9..0295e611ae697 100644
+--- a/chrome/browser/domain_reliability/service_factory.cc
++++ b/chrome/browser/domain_reliability/service_factory.cc
+@@ -27,6 +27,8 @@ bool ShouldCreateService(const DomainReliabilityServiceDelegate* delegate) {
+   base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+   if (command_line->HasSwitch(switches::kDisableDomainReliability))
+     return false;
++  if (command_line->HasSwitch("ungoogled-supermium"))
++    return false;
+   if (command_line->HasSwitch(switches::kEnableDomainReliability))
+     return true;
+   if (!delegate->IsDomainReliabilityAllowed()) {
+diff --git a/chrome/browser/download/chrome_download_manager_delegate.cc b/chrome/browser/download/chrome_download_manager_delegate.cc
+index df1bc60215471..90b1e2cec1a07 100644
+--- a/chrome/browser/download/chrome_download_manager_delegate.cc
++++ b/chrome/browser/download/chrome_download_manager_delegate.cc
+@@ -2143,6 +2143,10 @@ bool ChromeDownloadManagerDelegate::IsOpenInBrowserPreferredForFile(
+ bool ChromeDownloadManagerDelegate::ShouldBlockFile(
+     download::DownloadItem* item,
+     download::DownloadDangerType danger_type) const {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("disable-download-upload") ||
++        base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")){
++    return false;
++  }
+   // Chrome-initiated background downloads should not be blocked.
+   if (item && !item->RequireSafetyChecks()) {
+     return false;
+diff --git a/chrome/browser/download/download_target_determiner.cc b/chrome/browser/download/download_target_determiner.cc
+index 2e13f068914d9..debbe6558005a 100644
+--- a/chrome/browser/download/download_target_determiner.cc
++++ b/chrome/browser/download/download_target_determiner.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "base/command_line.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+@@ -916,6 +917,10 @@ DownloadTargetDeterminer::Result
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   next_state_ = STATE_DETERMINE_INTERMEDIATE_PATH;
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++      return CONTINUE;
++  }
++
+   // Checking if there are prior visits to the referrer is only necessary if the
+   // danger level of the download depends on the file type.
+   if (danger_type_ != download::DOWNLOAD_DANGER_TYPE_NOT_DANGEROUS &&
+diff --git a/chrome/browser/download/insecure_download_blocking.cc b/chrome/browser/download/insecure_download_blocking.cc
+index cfedddb9506df..271a1757efd2d 100644
+--- a/chrome/browser/download/insecure_download_blocking.cc
++++ b/chrome/browser/download/insecure_download_blocking.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <optional>
+ 
++#include "base/command_line.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/debug/dump_without_crashing.h"
+ #include "base/memory/raw_ptr.h"
+@@ -232,7 +233,8 @@ struct InsecureDownloadData {
+         download_source == DownloadSource::OFFLINE_PAGE ||
+         download_source == DownloadSource::INTERNAL_API ||
+         download_source == DownloadSource::EXTENSION_API ||
+-        download_source == DownloadSource::EXTENSION_INSTALLER) {
++        download_source == DownloadSource::EXTENSION_INSTALLER ||
++        base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")){
+       base::UmaHistogramEnumeration(
+           kInsecureDownloadHistogramName,
+           InsecureDownloadSecurityStatus::kDownloadIgnored);
+@@ -264,7 +266,8 @@ struct InsecureDownloadData {
+         download_source == DownloadSource::OFFLINE_PAGE ||
+         download_source == DownloadSource::INTERNAL_API ||
+         download_source == DownloadSource::EXTENSION_API ||
+-        download_source == DownloadSource::EXTENSION_INSTALLER) {
++        download_source == DownloadSource::EXTENSION_INSTALLER ||
++        base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")){
+       is_insecure_download_ = false;
+     } else {  // Not ignorable download.
+       // TODO(crbug.com/40857867): Add blocking metrics.
+diff --git a/chrome/browser/extensions/extension_management_internal.h b/chrome/browser/extensions/extension_management_internal.h
+index 43941aae7c368..d5b3bf686160c 100644
+--- a/chrome/browser/extensions/extension_management_internal.h
++++ b/chrome/browser/extensions/extension_management_internal.h
+@@ -189,7 +189,7 @@ struct GlobalSettings {
+   std::optional<std::vector<Manifest::Type>> allowed_types;
+ 
+   // An enum setting indicates if manifest v2 is allowed.
+-  ManifestV2Setting manifest_v2_setting = ManifestV2Setting::kDefault;
++  ManifestV2Setting manifest_v2_setting = ManifestV2Setting::kEnabled;
+ 
+   UnpublishedAvailability unpublished_availability_setting =
+       UnpublishedAvailability::kAllowUnpublished;
+diff --git a/chrome/browser/history/history_utils.cc b/chrome/browser/history/history_utils.cc
+index 6da2d4cc0e48b..44d66c6657049 100644
+--- a/chrome/browser/history/history_utils.cc
++++ b/chrome/browser/history/history_utils.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/history/history_utils.h"
+ 
++#include "base/command_line.h"
+ #include "chrome/common/url_constants.h"
+ #include "components/dom_distiller/core/url_constants.h"
+ #include "url/gurl.h"
+@@ -24,6 +25,8 @@ bool CanAddURLToHistory(const GURL& url) {
+       url.SchemeIs(content::kViewSourceScheme) ||
+       url.SchemeIs(chrome::kChromeNativeScheme) ||
+       url.SchemeIs(chrome::kChromeSearchScheme) ||
++      (url.SchemeIs(url::kTraceScheme) && 
++      base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) ||
+       url.SchemeIs(dom_distiller::kDomDistillerScheme))
+     return false;
+ 
+diff --git a/chrome/browser/media/router/discovery/dial/dial_service_impl.cc b/chrome/browser/media/router/discovery/dial/dial_service_impl.cc
+index 6e6ceee70a73a..e50fbdde69182 100644
+--- a/chrome/browser/media/router/discovery/dial/dial_service_impl.cc
++++ b/chrome/browser/media/router/discovery/dial/dial_service_impl.cc
+@@ -15,6 +15,7 @@
+ #include <vector>
+ 
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/containers/span.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+@@ -462,6 +463,9 @@ void DialServiceImpl::SendNetworkList(
+     const std::optional<NetworkInterfaceList>& networks) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++     return;
++
+   using InterfaceIndexAddressFamily = std::pair<uint32_t, net::AddressFamily>;
+   std::set<InterfaceIndexAddressFamily> interface_index_addr_family_seen;
+   net::IPAddressList ip_addresses;
+diff --git a/chrome/browser/media/webrtc/webrtc_log_uploader.cc b/chrome/browser/media/webrtc/webrtc_log_uploader.cc
+index d08eb68932594..fce7a2ce56b08 100644
+--- a/chrome/browser/media/webrtc/webrtc_log_uploader.cc
++++ b/chrome/browser/media/webrtc/webrtc_log_uploader.cc
+@@ -12,6 +12,7 @@
+ #include <string>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/containers/span.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+@@ -181,7 +182,6 @@ void WebRtcLogUploader::OnLoggingStopped(
+   DCHECK(!upload_done_data.paths.directory.empty());
+ 
+   std::string compressed_log = CompressLog(log_buffer.get());
+-
+   std::string local_log_id;
+ 
+   if (base::PathExists(upload_done_data.paths.directory)) {
+@@ -268,6 +268,11 @@ void WebRtcLogUploader::LoggingStoppedDoStore(
+   base::FilePath native_log_path =
+       log_paths.directory.AppendASCII(log_id).AddExtension(
+           FILE_PATH_LITERAL(".gz"));
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++      main_task_runner_->PostTask(FROM_HERE, 
++                                  base::BindOnce(std::move(done_callback), true, "Log doesn't exist."));
++      return;
++  }
+   WriteCompressedLogToFile(compressed_log, native_log_path);
+   AddLocallyStoredLogInfoToUploadListFile(log_list_path, log_id);
+ 
+diff --git a/chrome/browser/new_tab_page/one_google_bar/one_google_bar_loader_impl.cc b/chrome/browser/new_tab_page/one_google_bar/one_google_bar_loader_impl.cc
+index bfd5f86defa2f..babbed2a569a7 100644
+--- a/chrome/browser/new_tab_page/one_google_bar/one_google_bar_loader_impl.cc
++++ b/chrome/browser/new_tab_page/one_google_bar/one_google_bar_loader_impl.cc
+@@ -301,6 +301,9 @@ OneGoogleBarLoaderImpl::OneGoogleBarLoaderImpl(
+ OneGoogleBarLoaderImpl::~OneGoogleBarLoaderImpl() = default;
+ 
+ void OneGoogleBarLoaderImpl::Load(OneGoogleCallback callback) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++      return;
++  }
+   callbacks_.push_back(std::move(callback));
+ 
+   // Note: If there is an ongoing request, abandon it. It's possible that
+diff --git a/chrome/browser/new_tab_page/promos/promo_service.cc b/chrome/browser/new_tab_page/promos/promo_service.cc
+index 953c21a614396..444744351924c 100644
+--- a/chrome/browser/new_tab_page/promos/promo_service.cc
++++ b/chrome/browser/new_tab_page/promos/promo_service.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+@@ -171,6 +172,9 @@ PromoService::PromoService(
+ PromoService::~PromoService() = default;
+ 
+ void PromoService::Refresh() {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++     return;
++  }
+   std::string command_id;
+   // Replace the promo URL with "command:<id>" if such a command ID is set
+   // via the feature params.
+diff --git a/chrome/browser/safe_browsing/chrome_ping_manager_factory.cc b/chrome/browser/safe_browsing/chrome_ping_manager_factory.cc
+index 006da430b2802..8dfa9b2d54990 100644
+--- a/chrome/browser/safe_browsing/chrome_ping_manager_factory.cc
++++ b/chrome/browser/safe_browsing/chrome_ping_manager_factory.cc
+@@ -62,6 +62,9 @@ ChromePingManagerFactory::BuildServiceInstanceForBrowserContext(
+ #if BUILDFLAG(FULL_SAFE_BROWSING)
+   hats_delegate = std::make_unique<ChromeSafeBrowsingHatsDelegate>(profile);
+ #endif
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++    return nullptr;
++  }
+   return PingManager::Create(
+       GetV4ProtocolConfig(),
+       g_browser_process->safe_browsing_service()->GetURLLoaderFactory(profile),
+diff --git a/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.cc b/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.cc
+index f2a10504550ef..f900e59581ea5 100644
+--- a/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.cc
++++ b/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.cc
+@@ -11,6 +11,7 @@
+ #include <utility>
+ 
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/containers/span.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+@@ -285,6 +286,9 @@ GURL SpellcheckHunspellDictionary::GetDictionaryURL() {
+ }
+ 
+ void SpellcheckHunspellDictionary::DownloadDictionary(GURL url) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++      return;
++  }
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   DCHECK(browser_context_);
+ 
+diff --git a/chrome/browser/ui/navigator/browser_navigator_params_utils.cc b/chrome/browser/ui/navigator/browser_navigator_params_utils.cc
+index ed7dfb5b89a38..02edc37f95b49 100644
+--- a/chrome/browser/ui/navigator/browser_navigator_params_utils.cc
++++ b/chrome/browser/ui/navigator/browser_navigator_params_utils.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ 
++#include "base/command_line.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/renderer_host/chrome_navigation_ui_data.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+@@ -154,7 +155,8 @@ int GetIndexOfExistingTabMatchingURL(BrowserWindowInterface* browser,
+     // RewriteURLIfNecessary removes the "view-source:" scheme which could lead
+     // to incorrect matching, so ensure that the target and the candidate are
+     // either both view-source:, or neither is.
+-    if (tab_url.SchemeIs(content::kViewSourceScheme) != target_is_view_source) {
++    if (tab_url.SchemeIs(content::kViewSourceScheme) != target_is_view_source ||
++       (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium") && tab_url.SchemeIs(url::kTraceScheme))) {
+       continue;
+     }
+ 
+diff --git a/chrome/common/google_url_loader_throttle.cc b/chrome/common/google_url_loader_throttle.cc
+index 2c04ddf5dceb7..e0915986f13af 100644
+--- a/chrome/common/google_url_loader_throttle.cc
++++ b/chrome/common/google_url_loader_throttle.cc
+@@ -7,6 +7,7 @@
+ #include <optional>
+ #include <vector>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+@@ -173,6 +174,8 @@ void GoogleURLLoaderThrottle::DetachFromCurrentSequence() {}
+ void GoogleURLLoaderThrottle::WillStartRequest(
+     network::ResourceRequest* request,
+     bool* defer) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++      return;
+   if (dynamic_params_->force_safe_search) {
+     GURL new_url;
+     safe_search_api::ForceGoogleSafeSearch(request->url, &new_url);
+@@ -245,6 +248,8 @@ void GoogleURLLoaderThrottle::WillRedirectRequest(
+     const network::mojom::URLResponseHead& response_head,
+     bool* defer,
+     network::HttpRequestHeadersUpdateParams* headers_update_params) {
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++        return;
+   // URLLoaderThrottles can only change the redirect URL when the network
+   // service is enabled. The non-network service path handles this in
+   // ChromeNetworkDelegate.
+@@ -305,6 +310,8 @@ void GoogleURLLoaderThrottle::WillProcessResponse(
+     const GURL& response_url,
+     network::mojom::URLResponseHead* response_head,
+     bool* defer) {
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++        return;
+ #if BUILDFLAG(ENABLE_BOUND_SESSION_CREDENTIALS)
+   if (is_covered_by_bound_session_) {
+     RecordBoundSessionStatusMetrics(is_deferred_for_bound_session_,
+diff --git a/components/assist_ranker/ranker_url_fetcher.cc b/components/assist_ranker/ranker_url_fetcher.cc
+index 556fb59dce3ae..ab51e9a48c8ce 100644
+--- a/components/assist_ranker/ranker_url_fetcher.cc
++++ b/components/assist_ranker/ranker_url_fetcher.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/ref_counted.h"
+ #include "net/base/load_flags.h"
+@@ -35,6 +36,9 @@ bool RankerURLFetcher::Request(
+     const GURL& url,
+     RankerURLFetcher::Callback callback,
+     network::mojom::URLLoaderFactory* url_loader_factory) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++      return false;
++  }
+   // This function is not supposed to be called if the previous operation is not
+   // finished.
+   if (state_ == REQUESTING) {
+diff --git a/components/components_locale_settings.grd b/components/components_locale_settings.grd
+index b38478da3f5db..b5e30ffbdc1fe 100644
+--- a/components/components_locale_settings.grd
++++ b/components/components_locale_settings.grd
+@@ -20,7 +20,7 @@
+     <output filename="components_locale_settings_de.pak" type="data_package" lang="de" />
+     <output filename="components_locale_settings_el.pak" type="data_package" lang="el" />
+     <output filename="components_locale_settings_en-GB.pak" type="data_package" lang="en-GB" />
+-    <output filename="components_locale_settings_en-US.pak" type="data_package" lang="en" />
++    <output filename="components_locale_settings_en-US.pak" type="data_package" lang="en-GB" />
+     <output filename="components_locale_settings_es.pak" type="data_package" lang="es" />
+     <if expr="is_ios">
+       <then>
+diff --git a/components/components_strings.grd b/components/components_strings.grd
+index 46779147e569d..9f18a86340ed0 100644
+--- a/components/components_strings.grd
++++ b/components/components_strings.grd
+@@ -22,7 +22,7 @@
+     <output filename="components_strings_de.pak" type="data_package" lang="de" />
+     <output filename="components_strings_el.pak" type="data_package" lang="el" />
+     <output filename="components_strings_en-GB.pak" type="data_package" lang="en-GB" />
+-    <output filename="components_strings_en-US.pak" type="data_package" lang="en" />
++    <output filename="components_strings_en-US.pak" type="data_package" lang="en-GB" />
+     <output filename="components_strings_es.pak" type="data_package" lang="es" />
+     <if expr="is_ios">
+       <!-- iOS uses es-MX for es-419 -->
+diff --git a/components/domain_reliability/google_configs.cc b/components/domain_reliability/google_configs.cc
+index 72d8593686b8c..17d038b9c5245 100644
+--- a/components/domain_reliability/google_configs.cc
++++ b/components/domain_reliability/google_configs.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ 
++#include "base/command_line.h"
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+@@ -560,6 +561,8 @@ std::unique_ptr<const DomainReliabilityConfig> MaybeGetGoogleConfig(
+   bool is_www_subdomain =
+       base::StartsWith(hostname, "www.", base::CompareCase::SENSITIVE);
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return nullptr;
+   const auto itr = kGoogleConfigs.find(hostname);
+   if (itr != std::end(kGoogleConfigs)) {
+     return CreateGoogleConfig(hostname, itr->second, /*is_www=*/false);
+@@ -582,7 +585,8 @@ std::unique_ptr<const DomainReliabilityConfig> MaybeGetGoogleConfig(
+ std::vector<std::unique_ptr<const DomainReliabilityConfig>>
+ GetAllGoogleConfigsForTesting() {
+   std::vector<std::unique_ptr<const DomainReliabilityConfig>> configs_out;
+-
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return configs_out;
+   for (const auto& [hostname, params] : kGoogleConfigs) {
+     configs_out.push_back(CreateGoogleConfig(hostname, params, false));
+     if (params.duplicate_for_www) {
+diff --git a/components/domain_reliability/uploader.cc b/components/domain_reliability/uploader.cc
+index d3a4ea9030105..e99ba17b8b90a 100644
+--- a/components/domain_reliability/uploader.cc
++++ b/components/domain_reliability/uploader.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/containers/unique_ptr_adapters.h"
+ #include "base/functional/callback.h"
+ #include "base/logging.h"
+@@ -80,7 +81,7 @@ class DomainReliabilityUploaderImpl : public DomainReliabilityUploader,
+     if (discard_uploads_)
+       discarded_upload_count_++;
+ 
+-    if (discard_uploads_ || shutdown_) {
++    if (discard_uploads_ || shutdown_ || base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
+       DVLOG(1) << "Discarding report instead of uploading.";
+       UploadResult result;
+       result.status = UploadResult::SUCCESS;
+diff --git a/components/gcm_driver/gcm_client_impl.cc b/components/gcm_driver/gcm_client_impl.cc
+index d3fb7da106971..b569cdd6f912f 100644
+--- a/components/gcm_driver/gcm_client_impl.cc
++++ b/components/gcm_driver/gcm_client_impl.cc
+@@ -10,6 +10,7 @@
+ #include <string_view>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+@@ -408,6 +409,8 @@ void GCMClientImpl::OnLoadCompleted(
+ void GCMClientImpl::StartGCM() {
+   DCHECK(io_task_runner_->RunsTasksInCurrentSequence());
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return;
+   // Taking over the value of account_mappings before passing the ownership of
+   // load result to InitializeMCSClient.
+   std::vector<AccountMapping> account_mappings;
+@@ -431,6 +434,8 @@ void GCMClientImpl::StartGCM() {
+ 
+ void GCMClientImpl::InitializeMCSClient() {
+   DCHECK(network_connection_tracker_);
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return;
+   std::vector<GURL> endpoints;
+   endpoints.push_back(gservices_settings_.GetMCSMainEndpoint());
+   GURL fallback_endpoint = gservices_settings_.GetMCSFallbackEndpoint();
+@@ -611,6 +616,8 @@ void GCMClientImpl::RemoveHeartbeatInterval(const std::string& scope) {
+ void GCMClientImpl::StartCheckin() {
+   DCHECK(io_task_runner_->RunsTasksInCurrentSequence());
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return;
+   // Make sure no checkin is in progress.
+   if (checkin_request_)
+     return;
+@@ -634,6 +641,9 @@ void GCMClientImpl::OnCheckinCompleted(
+     const checkin_proto::AndroidCheckinResponse& checkin_response) {
+   DCHECK(io_task_runner_->RunsTasksInCurrentSequence());
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return;
++
+   checkin_request_.reset();
+ 
+   if (response_code == net::HTTP_UNAUTHORIZED ||
+diff --git a/components/google/core/common/google_util.cc b/components/google/core/common/google_util.cc
+index 7da40c476266a..9988687714d83 100644
+--- a/components/google/core/common/google_util.cc
++++ b/components/google/core/common/google_util.cc
+@@ -153,6 +153,8 @@ BASE_FEATURE(kIsViewerGoogleSearchUrl, base::FEATURE_ENABLED_BY_DEFAULT);
+ const char kGoogleHomepageURL[] = "https://www.google.com/";
+ 
+ bool HasGoogleSearchQueryParam(std::string_view str) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   url::Component query(0, static_cast<int>(str.length())), key, value;
+   while (url::ExtractQueryKeyValue(str, &query, &key, &value)) {
+     std::string_view key_str = str.substr(key.begin, key.len);
+@@ -203,6 +205,8 @@ std::string GetGoogleCountryCode(const GURL& google_homepage_url) {
+ GURL GetGoogleSearchURL(const GURL& google_homepage_url) {
+   // To transform the homepage URL into the corresponding search URL, add the
+   // "search" and the "q=" query string.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return google_homepage_url;
+   GURL::Replacements replacements;
+   replacements.SetPathStr("search");
+   replacements.SetQueryStr("q=");
+@@ -215,6 +219,10 @@ const GURL& CommandLineGoogleBaseURL() {
+   // then unconditionally return it.
+   static base::NoDestructor<std::string> switch_value;
+   static base::NoDestructor<GURL> base_url;
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++    *base_url = GURL();
++    return *base_url;
++  }
+   std::string current_switch_value(
+       base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+           switches::kGoogleBaseURL));
+@@ -229,6 +237,8 @@ const GURL& CommandLineGoogleBaseURL() {
+ }
+ 
+ bool StartsWithCommandLineGoogleBaseURL(const GURL& url) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   const GURL& base_url(CommandLineGoogleBaseURL());
+   return base_url.is_valid() &&
+          base::StartsWith(url.possibly_invalid_spec(), base_url.spec(),
+@@ -238,6 +248,8 @@ bool StartsWithCommandLineGoogleBaseURL(const GURL& url) {
+ bool IsGoogleDomainUrl(const GURL& url,
+                        SubdomainPermission subdomain_permission,
+                        PortPermission port_permission) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   return IsValidURL(url, port_permission) &&
+          IsCanonicalHostGoogleHostname(url.host(), subdomain_permission);
+ }
+diff --git a/components/omnibox/browser/autocomplete_input.cc b/components/omnibox/browser/autocomplete_input.cc
+index c7c8df76c6e18..891e4b73b9fa0 100644
+--- a/components/omnibox/browser/autocomplete_input.cc
++++ b/components/omnibox/browser/autocomplete_input.cc
+@@ -7,6 +7,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/command_line.h"
+ #include "base/i18n/case_conversion.h"
+ #include "base/logging.h"
+ #include "base/strings/strcat.h"
+@@ -590,7 +591,9 @@ void AutocompleteInput::ParseForEmphasizeComponents(
+   // For the view-source and blob schemes, we should emphasize the host of the
+   // URL qualified by the view-source or blob prefix.
+   if ((base::EqualsCaseInsensitiveASCII(scheme_str, kViewSourceScheme) ||
+-       base::EqualsCaseInsensitiveASCII(scheme_str, url::kBlobScheme)) &&
++       base::EqualsCaseInsensitiveASCII(scheme_str, url::kBlobScheme) ||
++       (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium") && 
++       base::EqualsCaseInsensitiveASCII(scheme_str, url::kTraceScheme))) &&
+       (static_cast<int>(text.length()) > after_scheme_and_colon)) {
+     // Obtain the URL prefixed by view-source or blob and parse it.
+     std::u16string_view real_url = text.substr(after_scheme_and_colon);
+diff --git a/components/search_engines/template_url.cc b/components/search_engines/template_url.cc
+index e723790d4771d..d3c05ffab7935 100644
+--- a/components/search_engines/template_url.cc
++++ b/components/search_engines/template_url.cc
+@@ -628,6 +628,8 @@ std::u16string TemplateURLRef::SearchTermToString16(
+ 
+ bool TemplateURLRef::HasGoogleBaseURLs(
+     const SearchTermsData& search_terms_data) const {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   ParseIfNecessary(search_terms_data);
+   return std::ranges::any_of(replacements_, [](const Replacement& replacement) {
+     return replacement.type == GOOGLE_BASE_URL ||
+diff --git a/components/search_engines/template_url_data_util.cc b/components/search_engines/template_url_data_util.cc
+index 9e91d92e47ff9..20112cb7b4648 100644
+--- a/components/search_engines/template_url_data_util.cc
++++ b/components/search_engines/template_url_data_util.cc
+@@ -9,6 +9,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/command_line.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/values.h"
+@@ -329,6 +330,11 @@ base::DictValue TemplateURLDataToDictionary(const TemplateURLData& data) {
+ std::unique_ptr<TemplateURLData> TemplateURLDataFromPrepopulatedEngine(
+     const TemplateURLPrepopulateData::PrepopulatedEngine& engine) {
+   std::vector<std::string> search_intent_params;
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium") &&
++          engine.name == std::u16string(u"Google")) {
++    return TemplateURLDataFromPrepopulatedEngine(TemplateURLPrepopulateData::nosearch);
++  }
++
+   for (const auto* search_intent_param : engine.search_intent_params) {
+     search_intent_params.emplace_back(search_intent_param);
+   }
+diff --git a/components/sync/base/command_line_switches.cc b/components/sync/base/command_line_switches.cc
+index 064326ef5273c..7481590a04b9e 100644
+--- a/components/sync/base/command_line_switches.cc
++++ b/components/sync/base/command_line_switches.cc
+@@ -11,7 +11,8 @@
+ namespace syncer {
+ 
+ bool IsSyncAllowedByFlag() {
+-  return !base::CommandLine::ForCurrentProcess()->HasSwitch(kDisableSync);
++  return !base::CommandLine::ForCurrentProcess()->HasSwitch(kDisableSync) &&
++         !base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium");
+ }
+ 
+ }  // namespace syncer
+diff --git a/components/translate/core/browser/translate_url_fetcher.cc b/components/translate/core/browser/translate_url_fetcher.cc
+index 3660fa7cab6c7..76bff2c263e78 100644
+--- a/components/translate/core/browser/translate_url_fetcher.cc
++++ b/components/translate/core/browser/translate_url_fetcher.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/ref_counted.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
+@@ -47,6 +48,8 @@ bool TranslateURLFetcherImpl::Request(const GURL& url,
+                                       bool is_incognito) {
+   // This function is not supposed to be called if the previous operation is not
+   // finished.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   if (state_ == REQUESTING) {
+     NOTREACHED();
+   }
+diff --git a/components/update_client/update_checker.cc b/components/update_client/update_checker.cc
+index 1b0e06f86ca18..0e083328b2730 100644
+--- a/components/update_client/update_checker.cc
++++ b/components/update_client/update_checker.cc
+@@ -15,6 +15,7 @@
+ #include <vector>
+ 
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/containers/flat_map.h"
+ #include "base/containers/span.h"
+ #include "base/containers/to_vector.h"
+@@ -106,6 +107,9 @@ void UpdateCheckerImpl::CheckForUpdates(
+     scoped_refptr<UpdateContext> context,
+     const base::flat_map<std::string, std::string>& additional_attributes,
+     UpdateCheckCallback update_check_callback) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++    return;
++  }
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+   update_check_callback_ = std::move(update_check_callback);
+diff --git a/components/url_formatter/url_fixer.cc b/components/url_formatter/url_fixer.cc
+index c84b9907cfea6..9b655b1630006 100644
+--- a/components/url_formatter/url_fixer.cc
++++ b/components/url_formatter/url_fixer.cc
+@@ -591,6 +591,9 @@ GURL FixupURLInternal(const std::string& text,
+     }
+   }
+ 
++  if (scheme == url::kTraceScheme && base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium")) {
++    return GURL();
++  }
+   // We handle the file scheme separately.
+   if (scheme == url::kFileScheme) {
+     return GURL(parts.scheme.is_valid() ? text : FixupPath(text));
+diff --git a/components/variations/net/variations_http_headers.cc b/components/variations/net/variations_http_headers.cc
+index 5d35d51f56c64..6e6f29a76e5f0 100644
+--- a/components/variations/net/variations_http_headers.cc
++++ b/components/variations/net/variations_http_headers.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -25,7 +26,6 @@
+ #include "url/gurl.h"
+ 
+ #if BUILDFLAG(IS_IOS)
+-#include "base/command_line.h"
+ #include "components/variations/net/variations_flags.h"
+ #include "net/base/url_util.h"
+ #endif  // BUILDFLAG(IS_IOS)
+@@ -374,6 +374,8 @@ CreateSimpleURLLoaderWithVariationsHeader(
+     const net::NetworkTrafficAnnotationTag& annotation_tag) {
+   bool variations_headers_added =
+       AppendVariationsHeader(request->url, incognito, signed_in, request.get());
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return nullptr;
+   std::unique_ptr<network::SimpleURLLoader> simple_url_loader =
+       network::SimpleURLLoader::Create(std::move(request), annotation_tag);
+   if (variations_headers_added) {
+diff --git a/content/browser/child_process_security_policy_impl.cc b/content/browser/child_process_security_policy_impl.cc
+index 6fde91c4db54d..40376f87b6a00 100644
+--- a/content/browser/child_process_security_policy_impl.cc
++++ b/content/browser/child_process_security_policy_impl.cc
+@@ -1126,6 +1126,9 @@ void ChildProcessSecurityPolicyImpl::RegisterDefaultSchemes() {
+   RegisterWebSafeScheme(url::kBlobScheme);
+   RegisterWebSafeScheme(url::kFileSystemScheme);
+ 
++  if(base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++      RegisterWebSafeScheme(url::kTraceScheme);
++
+   // We know about the following pseudo schemes and treat them specially.
+   RegisterPseudoScheme(url::kAboutScheme);
+   RegisterPseudoScheme(url::kJavaScriptScheme);
+diff --git a/extensions/browser/cws_info_service.cc b/extensions/browser/cws_info_service.cc
+index 8a36bc971b425..9b83c0b7fcf25 100644
+--- a/extensions/browser/cws_info_service.cc
++++ b/extensions/browser/cws_info_service.cc
+@@ -9,6 +9,7 @@
+ #include <string>
+ #include <string_view>
+ 
++#include "base/command_line.h"
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/containers/queue.h"
+ #include "base/features.h"
+@@ -426,6 +427,8 @@ std::unique_ptr<CWSInfoService::FetchContext> CWSInfoService::CreateRequests(
+ void CWSInfoService::SendRequest() {
+   auto resource_request = std::make_unique<network::ResourceRequest>();
+   resource_request->url = GURL(kRequestUrl);
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++      return; //resource_request->url = GURL("google-must-be-stopped");
+   // A POST request is sent with an override to GET due to server requirements.
+   resource_request->method = "POST";
+   resource_request->load_flags = net::LOAD_DISABLE_CACHE;
+diff --git a/google_apis/gaia/gaia_auth_fetcher.cc b/google_apis/gaia/gaia_auth_fetcher.cc
+index 13d03f0d73faa..5ecc1ca12dcfd 100644
+--- a/google_apis/gaia/gaia_auth_fetcher.cc
++++ b/google_apis/gaia/gaia_auth_fetcher.cc
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "base/base64url.h"
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+@@ -246,7 +247,8 @@ void GaiaAuthFetcher::CreateAndStartGaiaFetcher(
+     network::mojom::CredentialsMode credentials_mode,
+     const net::NetworkTrafficAnnotationTag& traffic_annotation) {
+   DCHECK(!fetch_pending_) << "Tried to fetch two things at once!";
+-
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++      return;
+   auto resource_request = std::make_unique<network::ResourceRequest>();
+   resource_request->url = gaia_gurl;
+   original_url_ = gaia_gurl;
+diff --git a/url/url_constants.h b/url/url_constants.h
+index c809d2a54cdfd..ed8d748c58b0f 100644
+--- a/url/url_constants.h
++++ b/url/url_constants.h
+@@ -50,6 +50,8 @@ inline constexpr char kMaterializedViewScheme[] = "materialized-view";
+ inline constexpr char kSteamScheme[] = "steam";
+ inline constexpr char kTelScheme[] = "tel";
+ inline constexpr char16_t kTelScheme16[] = u"tel";
++inline constexpr char kTraceScheme[] = "trk";
++inline constexpr char16_t kTraceScheme16[] = u"trk";
+ inline constexpr char kUrnScheme[] = "urn";
+ inline constexpr char16_t kUrnScheme16[] = u"urn";
+ inline constexpr char kUuidInPackageScheme[] = "uuid-in-package";
+diff --git a/url/url_util.cc b/url/url_util.cc
+index cedfbaf417db8..a4db1afa91684 100644
+--- a/url/url_util.cc
++++ b/url/url_util.cc
+@@ -81,6 +81,7 @@ struct SchemeRegistry {
+       kWssScheme,
+       kDataScheme,
+       kAboutScheme,
++      kTraceScheme,
+   };
+ 
+   // Schemes that normal pages cannot link to or access (i.e., with the same
+@@ -95,6 +96,7 @@ struct SchemeRegistry {
+       kAboutScheme,
+       kJavaScriptScheme,
+       kDataScheme,
++      kTraceScheme,
+   };
+ 
+   // Schemes that can be sent CORS requests.
