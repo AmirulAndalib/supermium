@@ -1,0 +1,826 @@
+diff --git a/media/audio/BUILD.gn b/media/audio/BUILD.gn
+index fb3a0e10509b0..27c6e5d477467 100644
+--- a/media/audio/BUILD.gn
++++ b/media/audio/BUILD.gn
+@@ -233,6 +233,8 @@ source_set("audio") {
+       "win/core_audio_util_win.h",
+       "win/device_enumeration_win.cc",
+       "win/device_enumeration_win.h",
++      "win/wavein_input_win.cc",
++      "win/wavein_input_win.h",
+       "win/waveout_output_win.cc",
+       "win/waveout_output_win.h",
+     ]
+diff --git a/media/audio/win/audio_manager_win.cc b/media/audio/win/audio_manager_win.cc
+index caa85a4d7c99e..90e5475117f8e 100644
+--- a/media/audio/win/audio_manager_win.cc
++++ b/media/audio/win/audio_manager_win.cc
+@@ -23,6 +23,7 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/task/bind_post_task.h"
+ #include "base/win/windows_version.h"
+ #include "media/audio/audio_device_description.h"
+@@ -33,6 +34,7 @@
+ #include "media/audio/win/core_audio_util_win.h"
+ #include "media/audio/win/device_enumeration_win.h"
+ #include "media/audio/win/waveout_output_win.h"
++#include "media/audio/win/wavein_input_win.h"
+ #include "media/base/audio_parameters.h"
+ #include "media/base/channel_layout.h"
+ #include "media/base/limits.h"
+@@ -69,6 +71,13 @@ constexpr int kMaxOutputStreams = 50;
+ // low usage according to crbug.com/40196320.
+ constexpr int kWinMaxWaveOutChannels = 8;
+ 
++// We use 3 buffers for recording audio so that if a recording callback takes
++// some time to return we won't lose audio. More buffers while recording are
++// ok because they don't introduce any delay in recording, unlike in playback
++// where you first need to fill in that number of buffers before starting to
++// play.
++static const int kNumInputBuffers = 3;
++
+ // Buffer size to use for input and output stream when a proper size can't be
+ // determined from the system
+ constexpr int kFallbackBufferSize = 2048;
+@@ -165,10 +174,12 @@ void AudioManagerWin::InitializeOnAudioThread() {
+   // callback to a WeakPtr: NotifyAllOutputDeviceChangeListeners() will be
+   // posted to the audio thread instead of being run synchronously, since we use
+   // BindPostTaskToCurrentDefault().
++  if (CoreAudioUtil::IsSupported()) {
+   output_device_listener_ = std::make_unique<AudioDeviceListenerWin>(
+       base::BindPostTaskToCurrentDefault(base::BindRepeating(
+           &AudioManagerWin::NotifyAllOutputDeviceChangeListeners,
+           weak_this_on_audio_thread_)));
++  }
+ }
+ 
+ bool AudioManagerWin::GetAudioDeviceNamesImpl(bool input,
+@@ -181,7 +192,9 @@ bool AudioManagerWin::GetAudioDeviceNamesImpl(bool input,
+           : GetOutputDeviceNamesWin(device_names, GetEnumerationLogCallback());
+ 
+   if (!device_names->empty()) {
+-    device_names->push_front(AudioDeviceName::CreateCommunications());
++    if (CoreAudioUtil::IsSupported()) {
++      device_names->push_front(AudioDeviceName::CreateCommunications());
++    }
+ 
+     // Always add default device parameters as first element.
+     device_names->push_front(AudioDeviceName::CreateDefault());
+@@ -202,18 +215,23 @@ bool AudioManagerWin::GetAudioOutputDeviceNames(
+ AudioParameters AudioManagerWin::GetInputStreamParameters(
+     const std::string& device_id) {
+   AudioParameters parameters;
+-  HRESULT hr = CoreAudioUtil::GetPreferredAudioParameters(
+-      device_id, /*is_output_device=*/false, &parameters);
++  HRESULT hr = E_FAIL;
++  if (CoreAudioUtil::IsSupported()) {
++    hr = CoreAudioUtil::GetPreferredAudioParameters(device_id, /*is_output_device*/false, 
++                                                    &parameters);
++  }
+ 
+   if (FAILED(hr) || !parameters.IsValid()) {
+-    LOG(WARNING) << "Unable to get preferred audio params for " << device_id
+-                 << " 0x" << std::hex << hr;
++    if (CoreAudioUtil::IsSupported()) {
++      LOG(WARNING) << "Unable to get preferred audio params for " << device_id
++                  << " 0x" << std::hex << hr;
++    }
+     // TODO(tommi): We appear to have callers to GetInputStreamParameters that
+     // rely on getting valid audio parameters returned for an invalid or
+     // unavailable device. We should track down those code paths (it is likely
+     // that they actually don't need a real device but depend on the audio
+     // code path somehow for a configuration - e.g. tab capture).
+-    parameters = AudioParameters(AudioParameters::AUDIO_PCM_LINEAR,
++    parameters = AudioParameters(AudioParameters::AUDIO_PCM_LOW_LATENCY,
+                                  ChannelLayoutConfig::Stereo(), 48000,
+                                  kFallbackBufferSize);
+   }
+@@ -227,6 +245,9 @@ AudioParameters AudioManagerWin::GetInputStreamParameters(
+ 
+ std::string AudioManagerWin::GetAssociatedOutputDeviceID(
+     const std::string& input_device_id) {
++  if (!CoreAudioUtil::IsSupported()) {
++    return std::string();
++  }
+   return CoreAudioUtil::GetMatchingOutputDeviceID(input_device_id);
+ }
+ 
+@@ -278,9 +299,14 @@ AudioOutputStream* AudioManagerWin::MakeLowLatencyOutputStream(
+   }
+ 
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+-          switches::kForceWaveAudio)) {
+-    DLOG(WARNING) << "Forcing usage of Windows WaveXxx APIs";
+-    return nullptr;
++      switches::kForceWaveAudio) || !CoreAudioUtil::IsSupported()) {
++        // Fall back to Windows Wave implementation on Windows XP or lower.
++        DLOG_IF(ERROR, !device_id.empty() &&
++                           device_id != AudioDeviceDescription::kDefaultDeviceId)
++            << "Opening by device id not supported by PCMWaveOutAudioOutputStream";
++        DVLOG(1) << "Using WaveOut since WASAPI requires at least Vista.";
++        return new PCMWaveOutAudioOutputStream(
++            this, params, NumberOfWaveOutBuffers(), WAVE_MAPPER);
+   }
+ 
+   // Pass an empty string to indicate that we want the default device
+@@ -313,7 +339,16 @@ AudioInputStream* AudioManagerWin::MakeLowLatencyInputStream(
+     const std::string& device_id,
+     const LogCallback& log_callback) {
+   // Used for both AUDIO_PCM_LOW_LATENCY and AUDIO_PCM_LINEAR.
+-  return new WASAPIAudioInputStream(this, params, device_id, log_callback);
++  AudioInputStream* stream = NULL;
++  if (!CoreAudioUtil::IsSupported()) {
++    // Fall back to Windows Wave implementation on Windows XP or lower.
++    DVLOG(1) << "Using WaveIn since WASAPI requires at least Vista.";
++    stream = CreatePCMWaveInAudioInputStream(params, device_id);
++  } else {
++    stream = new WASAPIAudioInputStream(this, params, device_id, log_callback);
++  }
++
++  return stream;
+ }
+ 
+ std::string AudioManagerWin::GetDefaultInputDeviceID() {
+@@ -321,6 +356,8 @@ std::string AudioManagerWin::GetDefaultInputDeviceID() {
+ }
+ 
+ std::string AudioManagerWin::GetDefaultOutputDeviceID() {
++  if (!CoreAudioUtil::IsSupported())
++    return std::string();
+   return CoreAudioUtil::GetDefaultOutputDeviceID();
+ }
+ 
+@@ -345,7 +382,8 @@ AudioParameters AudioManagerWin::GetPreferredOutputStreamParameters(
+   int default_buffer_size = 0;
+   bool attempt_audio_offload = CoreAudioUtil::IsAudioOffloadSupported(nullptr);
+ 
+-  if (cmd_line->HasSwitch(switches::kEnableExclusiveAudio)) {
++  if (CoreAudioUtil::IsSupported() && 
++      cmd_line->HasSwitch(switches::kEnableExclusiveAudio)) {
+     // TODO(rtoy): tune these values for best possible WebAudio
+     // performance. WebRTC works well at 48kHz and a buffer size of 480
+     // samples will be used for this case. Note that exclusive mode is
+@@ -355,7 +393,7 @@ AudioParameters AudioManagerWin::GetPreferredOutputStreamParameters(
+     buffer_size = 256;
+     if (input_params.IsValid())
+       channel_layout_config = input_params.channel_layout_config();
+-  } else {
++  } else if (CoreAudioUtil::IsSupported()) {
+     AudioParameters params;
+ 
+     HRESULT hr = CoreAudioUtil::GetPreferredAudioParameters(
+@@ -420,6 +458,17 @@ AudioParameters AudioManagerWin::GetPreferredOutputStreamParameters(
+ 
+     effects |= input_params.effects();
+ 
++    if (!CoreAudioUtil::IsSupported()) {
++      // If WASAPI isn't supported we'll fallback to WaveOut, which will take
++      // care of resampling and bits per sample changes.  By setting these
++      // equal to the input values, AudioOutputResampler will skip resampling
++      // and bit per sample differences (since the input parameters will match
++      // the output parameters).
++      buffer_size = input_params.frames_per_buffer();
++      sample_rate = input_params.sample_rate();
++      channel_layout_config = input_params.channel_layout_config();
++    }
++
+     // Allow non-default buffer sizes if we have a valid min and max.
+     if (min_buffer_size > 0 && max_buffer_size > 0) {
+       buffer_size =
+@@ -451,6 +500,75 @@ AudioParameters AudioManagerWin::GetPreferredOutputStreamParameters(
+   return params;
+ }
+ 
++// Taken from Mmddk.h.
++#define DRV_RESERVED 0x0800
++#define DRV_QUERYFUNCTIONINSTANCEID (DRV_RESERVED + 17)
++#define DRV_QUERYFUNCTIONINSTANCEIDSIZE (DRV_RESERVED + 18)
++
++std::string ConvertToWinXPInputDeviceId(const std::string& device_id) {
++  UINT number_of_active_devices = waveInGetNumDevs();
++  MMRESULT result = MMSYSERR_NOERROR;
++
++  UINT i = 0;
++  for (; i < number_of_active_devices; ++i) {
++    size_t size = 0;
++    // Get the size (including the terminating NULL) of the endpoint ID of the
++    // waveIn device.
++    result = waveInMessage(reinterpret_cast<HWAVEIN>(i),
++                           DRV_QUERYFUNCTIONINSTANCEIDSIZE,
++                           reinterpret_cast<DWORD_PTR>(&size), NULL);
++    if (result != MMSYSERR_NOERROR)
++      continue;
++
++    base::win::ScopedCoMem<WCHAR> id;
++    id.Reset(static_cast<WCHAR*>(CoTaskMemAlloc(size)));
++    if (!id)
++      continue;
++
++    // Get the endpoint ID string for this waveIn device.
++    result = waveInMessage(
++        reinterpret_cast<HWAVEIN>(i), DRV_QUERYFUNCTIONINSTANCEID,
++        reinterpret_cast<DWORD_PTR>(static_cast<WCHAR*>(id)), size);
++    if (result != MMSYSERR_NOERROR)
++      continue;
++
++    std::string utf8_id = base::WideToUTF8(static_cast<WCHAR*>(id));
++    // Check whether the endpoint ID string of this waveIn device matches that
++    // of the audio endpoint device.
++    if (device_id == utf8_id)
++      break;
++  }
++
++  // If a matching waveIn device was found, convert the unique endpoint ID
++  // string to a standard friendly name with max 32 characters.
++  if (i < number_of_active_devices) {
++    WAVEINCAPS capabilities;
++
++    result = waveInGetDevCaps(i, &capabilities, sizeof(capabilities));
++    if (result == MMSYSERR_NOERROR)
++      return base::WideToUTF8(capabilities.szPname);
++  }
++
++  return std::string();
++}
++
++AudioInputStream* AudioManagerWin::CreatePCMWaveInAudioInputStream(
++    const AudioParameters& params,
++    const std::string& device_id) {
++  std::string xp_device_id = device_id;
++  if (device_id != AudioDeviceDescription::kDefaultDeviceId) {
++    xp_device_id = ConvertToWinXPInputDeviceId(device_id);
++    if (xp_device_id.empty()) {
++      DLOG(ERROR) << "Cannot find a waveIn device which matches the device ID "
++                  << device_id;
++      return NULL;
++    }
++  }
++
++  return new PCMWaveInAudioInputStream(this, params, kNumInputBuffers,
++                                       xp_device_id);
++}
++
+ // static
+ std::unique_ptr<AudioManager> CreateAudioManager(
+     std::unique_ptr<AudioThread> audio_thread,
+diff --git a/media/audio/win/audio_manager_win.h b/media/audio/win/audio_manager_win.h
+index 4c3ff8d4282cd..b8afa10cf8946 100644
+--- a/media/audio/win/audio_manager_win.h
++++ b/media/audio/win/audio_manager_win.h
+@@ -76,6 +76,15 @@ class MEDIA_EXPORT AudioManagerWin : public AudioManagerBase {
+   // Allow unit test to modify the utilized enumeration API.
+   friend class AudioManagerTest;
+ 
++  // Returns a PCMWaveInAudioInputStream instance or NULL on failure.
++  // This method converts MMDevice-style device ID to WaveIn-style device ID if
++  // necessary.
++  // (Please see device_enumeration_win.h for more info about the two kinds of
++  // device IDs.)
++  AudioInputStream* CreatePCMWaveInAudioInputStream(
++      const AudioParameters& params,
++      const std::string& device_id);
++
+   // Helper methods for performing expensive initialization tasks on the audio
+   // thread instead of on the UI thread which AudioManager is constructed on.
+   void InitializeOnAudioThread();
+diff --git a/media/audio/win/device_enumeration_win.cc b/media/audio/win/device_enumeration_win.cc
+index e03da3bec53df..f5032655c0cea 100644
+--- a/media/audio/win/device_enumeration_win.cc
++++ b/media/audio/win/device_enumeration_win.cc
+@@ -231,6 +231,49 @@ std::string GetDeviceSuffixWithFallback(
+   return suffix;
+ }
+ 
++// The waveform API is weird in that it has completely separate but
++// almost identical functions and structs for input devices vs. output
++// devices. We deal with this by implementing the logic as a templated
++// function that takes the functions and struct type to use as
++// template parameters.
++template <UINT(__stdcall* NumDevsFunc)(),
++          typename CAPSSTRUCT,
++          MMRESULT(__stdcall* DevCapsFunc)(UINT_PTR, CAPSSTRUCT*, UINT)>
++static bool GetDeviceNamesWinXPImpl(AudioDeviceNames* device_names) {
++  // Retrieve the number of active waveform input devices.
++  UINT number_of_active_devices = NumDevsFunc();
++  if (number_of_active_devices == 0)
++    return true;
++
++  AudioDeviceName device;
++  CAPSSTRUCT capabilities;
++  MMRESULT err = MMSYSERR_NOERROR;
++
++  // Loop over all active capture devices and add friendly name and
++  // unique ID to the |device_names| list. Note that, for Wave on XP,
++  // the "unique" name will simply be a copy of the friendly name since
++  // there is no safe method to retrieve a unique device name on XP.
++  for (UINT i = 0; i < number_of_active_devices; ++i) {
++    // Retrieve the capabilities of the specified waveform-audio input device.
++    err = DevCapsFunc(i, &capabilities, sizeof(capabilities));
++    if (err != MMSYSERR_NOERROR)
++      continue;
++
++    // Store the user-friendly name. Max length is MAXPNAMELEN(=32)
++    // characters and the name cane be truncated on XP.
++    // Example: "Microphone (Realtek High Defini".
++    device.device_name = base::WideToUTF8(capabilities.szPname);
++
++    // Store the "unique" name (we use same as friendly name on Windows XP).
++    device.unique_id = device.device_name;
++
++    // Add combination of user-friendly and unique name to the output list.
++    device_names->push_back(device);
++  }
++
++  return true;
++}
++
+ // Converts a COM error into a human-readable string.
+ std::string ErrorToString(HRESULT hresult) {
+   return CoreAudioUtil::ErrorToString(hresult);
+@@ -375,12 +418,18 @@ static bool GetDeviceNamesWinImpl(
+ bool GetInputDeviceNamesWin(
+     AudioDeviceNames* device_names,
+     const media::AudioManager::LogCallback& log_callback) {
++  if (!CoreAudioUtil::IsSupported())
++     return GetDeviceNamesWinXPImpl<waveInGetNumDevs, WAVEINCAPSW,
++                                   waveInGetDevCapsW>(device_names);
+   return GetDeviceNamesWinImpl(eCapture, device_names, log_callback);
+ }
+ 
+ bool GetOutputDeviceNamesWin(
+     AudioDeviceNames* device_names,
+     const media::AudioManager::LogCallback& log_callback) {
++  if (!CoreAudioUtil::IsSupported())
++     return GetDeviceNamesWinXPImpl<waveOutGetNumDevs, WAVEOUTCAPSW,
++                                   waveOutGetDevCapsW>(device_names);
+   return GetDeviceNamesWinImpl(eRender, device_names, log_callback);
+ }
+ 
+diff --git a/media/audio/win/wavein_input_win.cc b/media/audio/win/wavein_input_win.cc
+new file mode 100644
+index 0000000000000..f206c95a3d115
+--- /dev/null
++++ b/media/audio/win/wavein_input_win.cc
+@@ -0,0 +1,310 @@
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++#pragma allow_unsafe_buffers
++#endif
++
++#include "media/audio/win/wavein_input_win.h"
++
++#include "base/logging.h"
++#include "base/time/time.h"
++#include "media/audio/audio_device_description.h"
++#include "media/audio/audio_io.h"
++#include "media/audio/win/audio_manager_win.h"
++#include "media/audio/win/device_enumeration_win.h"
++#include "media/base/audio_bus.h"
++#include "media/base/audio_sample_types.h"
++
++namespace media {
++
++// Our sound buffers are allocated once and kept in a linked list using the
++// the WAVEHDR::dwUser variable. The last buffer points to the first buffer.
++static WAVEHDR* GetNextBuffer(WAVEHDR* current) {
++  return reinterpret_cast<WAVEHDR*>(current->dwUser);
++}
++
++constexpr SampleFormat kSampleFormat = kSampleFormatS16;
++
++PCMWaveInAudioInputStream::PCMWaveInAudioInputStream(
++    AudioManagerWin* manager,
++    const AudioParameters& params,
++    int num_buffers,
++    const std::string& device_id)
++    : state_(kStateEmpty),
++      manager_(manager),
++      callback_(nullptr),
++      num_buffers_(num_buffers),
++      channels_(params.channels()),
++      device_id_(device_id),
++      wavein_(nullptr),
++      buffer_(nullptr),
++      audio_bus_(media::AudioBus::Create(params)) {
++  DCHECK_GT(num_buffers_, 0);
++  format_.wFormatTag = WAVE_FORMAT_PCM;
++  format_.nChannels = params.channels() > 2 ? 2 : params.channels();
++  format_.nSamplesPerSec = params.sample_rate();
++  format_.wBitsPerSample = SampleFormatToBitsPerChannel(kSampleFormat);
++  format_.cbSize = 0;
++  format_.nBlockAlign = (format_.nChannels * format_.wBitsPerSample) / 8;
++  format_.nAvgBytesPerSec = format_.nBlockAlign * format_.nSamplesPerSec;
++  buffer_size_ = params.frames_per_buffer() * format_.nBlockAlign;
++  // If we don't have a packet size we use 100ms.
++  if (!buffer_size_)
++    buffer_size_ = format_.nAvgBytesPerSec / 10;
++  // The event is auto-reset.
++  stopped_event_.Set(::CreateEventW(NULL, FALSE, FALSE, NULL));
++}
++
++PCMWaveInAudioInputStream::~PCMWaveInAudioInputStream() {
++  DCHECK(NULL == wavein_);
++}
++
++AudioInputStream::OpenOutcome PCMWaveInAudioInputStream::Open() {
++  DCHECK(thread_checker_.CalledOnValidThread());
++  if (state_ != kStateEmpty)
++    return AudioInputStream::OpenOutcome::kFailed;
++  if (num_buffers_ < 2 || num_buffers_ > 10)
++    return AudioInputStream::OpenOutcome::kFailed;
++
++  // Convert the stored device id string into an unsigned integer
++  // corresponding to the selected device.
++  UINT device_id = WAVE_MAPPER;
++  if (!GetDeviceId(&device_id)) {
++    return AudioInputStream::OpenOutcome::kFailed;
++  }
++
++  // Open the specified input device for recording.
++  MMRESULT result = MMSYSERR_NOERROR;
++  result = ::waveInOpen(&wavein_, device_id, &format_,
++                        reinterpret_cast<DWORD_PTR>(WaveCallback),
++                        reinterpret_cast<DWORD_PTR>(this),
++                        CALLBACK_FUNCTION);
++  if (result != MMSYSERR_NOERROR)
++    return AudioInputStream::OpenOutcome::kFailed;
++
++  SetupBuffers();
++  state_ = kStateReady;
++  return AudioInputStream::OpenOutcome::kSuccess;
++}
++
++void PCMWaveInAudioInputStream::SetupBuffers() {
++  WAVEHDR* last = NULL;
++  WAVEHDR* first = NULL;
++  for (int ix = 0; ix != num_buffers_; ++ix) {
++    uint32_t sz = sizeof(WAVEHDR) + buffer_size_;
++    buffer_ =  reinterpret_cast<WAVEHDR*>(new char[sz]);
++    WAVEHDR* buffer_local = buffer_;
++    buffer_->lpData = reinterpret_cast<char*>(buffer_local) + sizeof(WAVEHDR);
++    buffer_->dwBufferLength = buffer_size_;
++    buffer_->dwBytesRecorded = 0;
++    buffer_->dwUser = reinterpret_cast<DWORD_PTR>(last);
++    buffer_->dwFlags = WHDR_DONE;
++    buffer_->dwLoops = 0;
++    if (ix == 0)
++      first = buffer_;
++    last = buffer_;
++    ::waveInPrepareHeader(wavein_, buffer_, sizeof(WAVEHDR));
++  }
++  // Fix the first buffer to point to the last one.
++  first->dwUser = reinterpret_cast<DWORD_PTR>(last);
++}
++
++void PCMWaveInAudioInputStream::FreeBuffers() {
++  WAVEHDR* current = buffer_;
++  for (int ix = 0; ix != num_buffers_; ++ix) {
++    WAVEHDR* next = GetNextBuffer(current);
++    if (current->dwFlags & WHDR_PREPARED)
++      ::waveInUnprepareHeader(wavein_, current, sizeof(WAVEHDR));
++    delete[] reinterpret_cast<char*>(current);
++    current = next;
++  }
++  buffer_ = nullptr;
++}
++
++void PCMWaveInAudioInputStream::Start(AudioInputCallback* callback) {
++  DCHECK(thread_checker_.CalledOnValidThread());
++  if (state_ != kStateReady)
++    return;
++
++  DCHECK(!callback_);
++  callback_ = callback;
++  state_ = kStateRecording;
++
++  WAVEHDR* buffer = buffer_;
++  for (int ix = 0; ix != num_buffers_; ++ix) {
++    QueueNextPacket(buffer);
++    buffer = GetNextBuffer(buffer);
++  }
++  buffer = buffer_;
++
++  MMRESULT result = ::waveInStart(wavein_);
++  if (result != MMSYSERR_NOERROR) {
++    HandleError(result);
++    state_ = kStateReady;
++    callback_ = nullptr;
++  }
++}
++
++// Stopping is tricky. First, no buffer should be locked by the audio driver
++// or else the waveInReset() will deadlock and secondly, the callback should
++// not be inside the AudioInputCallback's OnData because waveInReset()
++// forcefully kills the callback thread.
++void PCMWaveInAudioInputStream::Stop() {
++  DVLOG(1) << "PCMWaveInAudioInputStream::Stop()";
++  DCHECK(thread_checker_.CalledOnValidThread());
++  if (state_ != kStateRecording)
++    return;
++
++  bool already_stopped = false;
++  {
++    // Tell the callback that we're stopping.
++    // As a result, |stopped_event_| will be signaled in callback method.
++    base::AutoLock auto_lock(lock_);
++    already_stopped = (callback_ == nullptr);
++    callback_ = nullptr;
++  }
++
++  if (already_stopped)
++    return;
++
++  // Wait for the callback to finish, it will signal us when ready to be reset.
++  DWORD wait = ::WaitForSingleObject(stopped_event_.Get(), INFINITE);
++  DCHECK_EQ(wait, WAIT_OBJECT_0);
++
++  // Stop input and reset the current position to zero for |wavein_|.
++  // All pending buffers are marked as done and returned to the application.
++  MMRESULT res = ::waveInReset(wavein_);
++  DCHECK_EQ(res, static_cast<MMRESULT>(MMSYSERR_NOERROR));
++
++  state_ = kStateReady;
++}
++
++void PCMWaveInAudioInputStream::Close() {
++  DVLOG(1) << "PCMWaveInAudioInputStream::Close()";
++  DCHECK(thread_checker_.CalledOnValidThread());
++
++  // We should not call Close() while recording. Catch it with DCHECK and
++  // implement auto-stop just in case.
++  DCHECK_NE(state_, kStateRecording);
++  Stop();
++
++  if (wavein_) {
++    FreeBuffers();
++
++    // waveInClose() generates a WIM_CLOSE callback.  In case Start() was never
++    // called, force a reset to ensure close succeeds.
++    MMRESULT res = ::waveInReset(wavein_);
++    DCHECK_EQ(res, static_cast<MMRESULT>(MMSYSERR_NOERROR));
++    res = ::waveInClose(wavein_);
++    DCHECK_EQ(res, static_cast<MMRESULT>(MMSYSERR_NOERROR));
++    state_ = kStateClosed;
++    wavein_ = NULL;
++  }
++
++  // Tell the audio manager that we have been released. This can result in
++  // the manager destroying us in-place so this needs to be the last thing
++  // we do on this function.
++  manager_->ReleaseInputStream(this);
++}
++
++double PCMWaveInAudioInputStream::GetMaxVolume() {
++  // TODO(henrika): Add volume support using the Audio Mixer API.
++  return 0.0;
++}
++
++void PCMWaveInAudioInputStream::SetVolume(double volume) {
++  // TODO(henrika): Add volume support using the Audio Mixer API.
++}
++
++double PCMWaveInAudioInputStream::GetVolume() {
++  // TODO(henrika): Add volume support using the Audio Mixer API.
++  return 0.0;
++}
++
++bool PCMWaveInAudioInputStream::SetAutomaticGainControl(bool enabled) {
++  // TODO(henrika): Add AGC support when volume control has been added.
++  return false;
++}
++
++bool PCMWaveInAudioInputStream::GetAutomaticGainControl() {
++  // TODO(henrika): Add AGC support when volume control has been added.
++  return false;
++}
++
++bool PCMWaveInAudioInputStream::IsMuted() {
++  return false;
++}
++
++void PCMWaveInAudioInputStream::HandleError(MMRESULT error) {
++  DLOG(WARNING) << "PCMWaveInAudio error " << error;
++  if (callback_)
++    callback_->OnError();
++}
++
++void PCMWaveInAudioInputStream::QueueNextPacket(WAVEHDR *buffer) {
++  MMRESULT res = ::waveInAddBuffer(wavein_, buffer, sizeof(WAVEHDR));
++  if (res != MMSYSERR_NOERROR)
++    HandleError(res);
++}
++
++bool PCMWaveInAudioInputStream::GetDeviceId(UINT* device_index) {
++  // Deliver the default input device id (WAVE_MAPPER) if the default
++  // device has been selected.
++  if (device_id_ == AudioDeviceDescription::kDefaultDeviceId) {
++    *device_index = WAVE_MAPPER;
++    return true;
++  }
++  return false;
++}
++
++// Windows calls us back in this function when some events happen. Most notably
++// when it has an audio buffer with recorded data.
++void PCMWaveInAudioInputStream::WaveCallback(HWAVEIN hwi, UINT msg,
++                                             DWORD_PTR instance,
++                                             DWORD_PTR param1, DWORD_PTR) {
++  PCMWaveInAudioInputStream* obj =
++      reinterpret_cast<PCMWaveInAudioInputStream*>(instance);
++
++  // The lock ensures that Stop() can't be called during a callback.
++  base::AutoLock auto_lock(obj->lock_);
++
++  if (msg == WIM_DATA) {
++    // The WIM_DATA message is sent when waveform-audio data is present in
++    // the input buffer and the buffer is being returned to the application.
++    // The message can be sent when the buffer is full or after the
++    // waveInReset function is called.
++    if (obj->callback_) {
++      // TODO(henrika): the |volume| parameter is always set to zero since
++      // there is currently no support for controlling the microphone volume
++      // level.
++      WAVEHDR* buffer = reinterpret_cast<WAVEHDR*>(param1);
++      obj->audio_bus_->FromInterleaved<SignedInt16SampleTypeTraits>(
++          reinterpret_cast<int16_t*>(buffer->lpData), obj->audio_bus_->frames());
++      obj->callback_->OnData(obj->audio_bus_.get(), base::TimeTicks::Now(), 0.0, {});
++
++      // Queue the finished buffer back with the audio driver. Since we are
++      // reusing the same buffers we can get away without calling
++      // waveInPrepareHeader.
++      obj->QueueNextPacket(buffer);
++    } else {
++      // Main thread has called Stop() and set |callback_| to NULL and is
++      // now waiting to issue waveInReset which will kill this thread.
++      // We should not call AudioSourceCallback code anymore.
++      ::SetEvent(obj->stopped_event_.Get());
++    }
++  } else if (msg == WIM_CLOSE) {
++    // Intentionaly no-op for now.
++  } else if (msg == WIM_OPEN) {
++    // Intentionaly no-op for now.
++  }
++}
++
++void PCMWaveInAudioInputStream::SetOutputDeviceForAec(
++    const std::string& output_device_id) {
++  // Not supported. Do nothing.
++}
++
++
++}  // namespace media
+\ No newline at end of file
+diff --git a/media/audio/win/wavein_input_win.h b/media/audio/win/wavein_input_win.h
+new file mode 100644
+index 0000000000000..2a38e16327599
+--- /dev/null
++++ b/media/audio/win/wavein_input_win.h
+@@ -0,0 +1,141 @@
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_AUDIO_WIN_WAVEIN_INPUT_WIN_H_
++#define MEDIA_AUDIO_WIN_WAVEIN_INPUT_WIN_H_
++
++#include <windows.h>
++#include <mmsystem.h>
++#include <stdint.h>
++
++#include <memory>
++#include <string>
++
++#include "base/compiler_specific.h"
++#include "base/synchronization/lock.h"
++#include "base/threading/thread_checker.h"
++#include "base/win/scoped_handle.h"
++#include "media/audio/audio_io.h"
++#include "media/audio/audio_manager_base.h"
++#include "media/base/audio_parameters.h"
++
++// Put this in the declarations for a class to be uncopyable and unassignable.
++
++
++namespace media {
++
++class AudioBus;
++class AudioManagerWin;
++
++class PCMWaveInAudioInputStream : public  AudioInputStream {
++ public:
++  // The ctor takes all the usual parameters, plus |manager| which is the
++  // the audio manager who is creating this object and |device_id| which
++  // is provided by the operating system.
++  PCMWaveInAudioInputStream(AudioManagerWin* manager,
++                            const AudioParameters& params,
++                            int num_buffers,
++                            const std::string& device_id);
++  ~PCMWaveInAudioInputStream() override;
++
++  // Implementation of AudioInputStream.
++  OpenOutcome Open() override;
++  void Start(AudioInputCallback* callback) override;
++  void Stop() override;
++  void Close() override;
++  // TODO(henrika): Add volume support using the Audio Mixer API.
++  double GetMaxVolume() override;
++  void SetVolume(double volume) override;
++  double GetVolume() override;
++  bool SetAutomaticGainControl(bool enabled) override;
++  bool GetAutomaticGainControl() override;
++  bool IsMuted() override;
++  void SetOutputDeviceForAec(const std::string& output_device_id) override;
++
++ private:
++  enum State {
++    kStateEmpty,      // Initial state.
++    kStateReady,      // Device obtained and ready to record.
++    kStateRecording,  // Recording audio.
++    kStateStopping,   // Trying to stop, waiting for callback to finish.
++    kStateStopped,    // Stopped. Device was reset.
++    kStateClosed      // Device has been released.
++  };
++
++  // Allow unit tests to query the device ID.
++  friend class AudioManagerTest;
++
++  // Windows calls us back with the recorded audio data here. See msdn
++  // documentation for 'waveInProc' for details about the parameters.
++  static void CALLBACK WaveCallback(HWAVEIN hwi, UINT msg, DWORD_PTR instance,
++                                    DWORD_PTR param1, DWORD_PTR param2);
++
++  // If windows reports an error this function handles it and passes it to
++  // the attached AudioInputCallback::OnError().
++  void HandleError(MMRESULT error);
++
++  // Allocates and prepares the memory that will be used for recording.
++  void SetupBuffers();
++
++  // Deallocates the memory allocated in SetupBuffers.
++  void FreeBuffers();
++
++  // Sends a buffer to the audio driver for recording.
++  void QueueNextPacket(WAVEHDR* buffer);
++
++  // Converts the stored device id string into an unsigned integer which
++  // can be used by waveInOpen() to open the specified capture device.
++  bool GetDeviceId(UINT* device_index);
++
++  base::ThreadChecker thread_checker_;
++
++  // Reader beware. Visual C has stronger guarantees on volatile vars than
++  // most people expect. In fact, it has release semantics on write and
++  // acquire semantics on reads. See the msdn documentation.
++  volatile State state_;
++
++  // The audio manager that created this input stream. We notify it when
++  // we close so it can release its own resources.
++  raw_ptr<AudioManagerWin> manager_;
++
++  // We use the callback mostly to periodically give the recorded audio data.
++  raw_ptr<AudioInputCallback> callback_;
++
++  // The number of buffers of size |buffer_size_| each to use.
++  const int num_buffers_;
++
++  // The size in bytes of each audio buffer.
++  uint32_t buffer_size_;
++
++  // Channels, 1 or 2.
++  const int channels_;
++
++  // Contains the unique name of the selected endpoint device.
++  // Note that AudioDeviceDescription::kDefaultDeviceId represents the default
++  // device role and is not a valid ID as such.
++  std::string device_id_;
++
++  // Windows native structure to encode the format parameters.
++  WAVEFORMATEX format_;
++
++  // Handle to the instance of the wave device.
++  HWAVEIN wavein_;
++
++  // Pointer to the first allocated audio buffer. This object owns it.
++  raw_ptr<WAVEHDR> buffer_;
++
++  // An event that is signaled when the callback thread is ready to stop.
++  base::win::ScopedHandle stopped_event_;
++
++  // Lock used to avoid conflicts when Stop() is called during a callback.
++  base::Lock lock_;
++
++  // Extra audio bus used for storage of deinterleaved data for the OnData
++  // callback.
++  std::unique_ptr<media::AudioBus> audio_bus_;
++};
++
++}  // namespace media
++
++#endif  // MEDIA_AUDIO_WIN_WAVEIN_INPUT_WIN_H_
+\ No newline at end of file
