@@ -1,0 +1,37 @@
+diff --git a/core/fxge/cfx_font.cpp b/core/fxge/cfx_font.cpp
+index 87dd65f00..060c6893d 100644
+--- a/core/fxge/cfx_font.cpp
++++ b/core/fxge/cfx_font.cpp
+@@ -218,6 +218,17 @@ void CFX_Font::LoadSubstFace(const ByteString& face_name,
+       subst_font_.get());
+   if (face_) {
+     font_data_ = face_->GetData();
++  } else {
++    face_ = CFX_GEModule::Get()->GetFontMgr()->GetBuiltinMapper()->FindSubstFace(
++      "Arial Unicode MS", bTrueType, flags, weight, italic_angle, code_page,
++      subst_font_.get());
++  }
++  if (face_) {
++    font_data_ = face_->GetData();
++  } else {
++    face_ = CFX_GEModule::Get()->GetFontMgr()->GetBuiltinMapper()->FindSubstFace(
++      "Tahoma", bTrueType, flags, weight, italic_angle, code_page,
++      subst_font_.get());
+   }
+ }
+ 
+diff --git a/xfa/fgas/font/cfgas_fontmgr.cpp b/xfa/fgas/font/cfgas_fontmgr.cpp
+index 890a15d5d..186265ebb 100644
+--- a/xfa/fgas/font/cfgas_fontmgr.cpp
++++ b/xfa/fgas/font/cfgas_fontmgr.cpp
+@@ -216,7 +216,9 @@ std::deque<FX_FONTDESCRIPTOR> EnumGdiFonts(WideStringView face_name) {
+     dest_face_name_with_null[src_face_name.size() + 1] = 0;
+   }
+   HDC hdc = ::GetDC(nullptr);
+-  CHECK(hdc);
++  if (!hdc) {
++    return fonts;
++  }
+   EnumFontFamiliesExW(hdc, (LPLOGFONTW)&lfFind, (FONTENUMPROCW)GdiFontEnumProc,
+                       (LPARAM)&fonts, 0);
+   ::ReleaseDC(nullptr, hdc);
